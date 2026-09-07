@@ -49,6 +49,7 @@ Thumbs.db
 *.flv
 *.mov
 *.wmv
+*.zip
 
 # VS Code
 .vscode
@@ -72,3 +73,6 @@ local_checkpoints_waq_distill/
 .env
 .env.*
 !.env.example
+
+paper_locomotion_eval
+paper_offline_eval
