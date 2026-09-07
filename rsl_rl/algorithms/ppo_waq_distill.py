@@ -286,4 +286,5 @@ class PPO_WAQ_Distill:
             "action_l1_mean": total_l1 / update_count,
             "action_mse_mean": total_mse / update_count,
             "learning_rate": self.optimizer.param_groups[0]["lr"],
+            "optimizer_updates": update_count,
         }

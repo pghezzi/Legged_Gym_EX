@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import os
+import json
 import statistics
 import time
 from collections import deque
 
 import torch
+
+from rsl_rl.utils.training_cost import (
+    artifact_size_mb,
+    cuda_device_info,
+    peak_memory_mb,
+    provenance_map,
+    synchronize,
+    write_cost_record,
+)
 
 from rsl_rl.algorithms import PPO_WAQ_Distill
 from rsl_rl.env import VecEnv
@@ -27,6 +37,8 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
         log_dir=None,
         device="cpu",
     ):
+        self._cost_device = torch.device(device)
+        self._post_specialist_started = time.perf_counter()
         self.distillation_cfg = env.cfg.distillation
         super().__init__(env, train_cfg, log_dir, device)
 
@@ -129,6 +141,13 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
         num_learning_iterations,
         init_at_random_ep_len=False,
     ):
+        cost_start_iteration = self.current_learning_iteration
+        session_data_generation_s = 0.0
+        session_optimization_s = 0.0
+        session_optimizer_updates = 0
+        session_completed_episodes = torch.zeros(
+            (), dtype=torch.long, device=self.device
+        )
         self._pre_learn(init_at_random_ep_len)
 
         if self.current_learning_iteration == 0:
@@ -169,6 +188,7 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
             self.current_learning_iteration,
             total_iterations,
         ):
+            synchronize(self.device)
             start = time.time()
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
@@ -201,6 +221,7 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
                     depth_image = depth_image.to(self.device)
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
+                    session_completed_episodes += torch.count_nonzero(dones)
 
                     # Rewards/dones are not part of the imitation loss.
                     self.alg.process_env_step(
@@ -231,10 +252,16 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
                             cur_reward_sum[done_ids] = 0
                             cur_episode_length[done_ids] = 0
 
+            synchronize(self.device)
             collection_time = time.time() - start
+            synchronize(self.device)
             start = time.time()
             mean_loss, stats = self.alg.update()
+            synchronize(self.device)
             learn_time = time.time() - start
+            session_data_generation_s += collection_time
+            session_optimization_s += learn_time
+            session_optimizer_updates += int(stats["optimizer_updates"])
 
             if self.log_dir is not None:
                 self._log_distill(
@@ -265,6 +292,97 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
                 f"model_{self.current_learning_iteration}.pt",
             )
         )
+        final_checkpoint = os.path.join(
+            self.log_dir, f"model_{self.current_learning_iteration}.pt"
+        )
+        synchronize(self.device)
+        total_wallclock_s = time.perf_counter() - self._post_specialist_started
+        session_completed_episode_count = int(session_completed_episodes.item())
+        rollout_iterations = self.current_learning_iteration - cost_start_iteration
+        rollout_samples = rollout_iterations * self.num_steps_per_env * self.env.num_envs
+        device_info = cuda_device_info(self.device)
+        mini_batch_size = (
+            self.num_steps_per_env * self.env.num_envs // self.alg.num_mini_batches
+        )
+        cost_record = {
+            "schema_version": 1,
+            "run_type": "distillation_training",
+            "method": "Distilled Policy",
+            "seed": self.all_cfg.get("seed", getattr(self.env.cfg, "seed", None)),
+            "log_dir": self.log_dir,
+            "final_checkpoint": final_checkpoint,
+            "start_iteration": cost_start_iteration,
+            "end_iteration": self.current_learning_iteration,
+            "distillation_iterations": rollout_iterations,
+            "distillation_epochs": rollout_iterations * self.alg.num_learning_epochs,
+            "optimizer_updates": session_optimizer_updates,
+            "batch_size": mini_batch_size,
+            "num_mini_batches": self.alg.num_mini_batches,
+            "num_learning_epochs": self.alg.num_learning_epochs,
+            "num_parallel_envs": int(self.env.num_envs),
+            "rollout_steps_per_env_per_iteration": self.num_steps_per_env,
+            "training_samples": rollout_samples,
+            "teacher_labelled_samples": rollout_samples,
+            "data_env_steps": rollout_samples,
+            "additional_locomotion_policy_training": True,
+            "additional_locomotion_policy_env_steps": rollout_samples,
+            "total_post_specialist_env_steps": rollout_samples,
+            "simulator_substeps": rollout_samples * int(self.env.cfg.control.decimation),
+            "episodes_completed": session_completed_episode_count,
+            "data_generation_s": session_data_generation_s,
+            "preprocessing_s": 0.0,
+            "optimization_s": session_optimization_s,
+            "total_wallclock_s": total_wallclock_s,
+            "gpu_active_time_s": None,
+            "gpu_hours": total_wallclock_s / 3600.0 if device_info["gpu_count"] else 0.0,
+            "peak_gpu_memory_mb": peak_memory_mb(self.device),
+            "trainable_params": sum(parameter.numel() for parameter in self.alg.distillation_parameters),
+            "artifact_size_mb": artifact_size_mb(final_checkpoint),
+            "teacher_checkpoints": [teacher["checkpoint"] for teacher in self.distillation_cfg.teachers],
+            "teacher_rollout_collection": True,
+            "iterative_data_aggregation": True,
+            "persistent_replay_dataset": False,
+            **device_info,
+            "notes": [
+                "The standard train entrypoint starts accounting before environment/student/teacher construction; specialist checkpoints are frozen inputs.",
+                "Student-controlled rollout states receive teacher labels online (DAgger-like aggregation).",
+                "data_env_steps and additional_locomotion_policy_env_steps describe the same interactions; total_post_specialist_env_steps counts their union once.",
+                "Rollout storage is reused for optimization without additional simulator steps.",
+                "GPU-hours are synchronized allocated-device wall-clock; kernel-active time requires an external profiler.",
+            ],
+        }
+        cost_record["metric_status"] = provenance_map(cost_record)
+        cost_record["metric_status"]["gpu_active_time_s"] = "unavailable"
+        cost_record["metric_status"]["gpu_hours"] = (
+            "reconstructed" if device_info["gpu_count"] else "measured"
+        )
+        cost_path = os.path.join(self.log_dir, "training_cost.json")
+        if cost_start_iteration > 0 and os.path.isfile(cost_path):
+            with open(cost_path, encoding="utf-8") as stream:
+                previous = json.load(stream)
+            if previous.get("end_iteration") == cost_start_iteration:
+                for key in (
+                    "distillation_iterations", "distillation_epochs",
+                    "optimizer_updates", "training_samples",
+                    "teacher_labelled_samples", "data_env_steps",
+                    "additional_locomotion_policy_env_steps",
+                    "total_post_specialist_env_steps", "episodes_completed",
+                    "data_generation_s", "optimization_s", "total_wallclock_s",
+                    "gpu_hours",
+                ):
+                    if previous.get(key) is not None and cost_record.get(key) is not None:
+                        cost_record[key] += previous[key]
+                previous_peak = previous.get("peak_gpu_memory_mb")
+                if previous_peak is not None:
+                    cost_record["peak_gpu_memory_mb"] = max(
+                        previous_peak, cost_record.get("peak_gpu_memory_mb") or 0.0
+                    )
+                cost_record["start_iteration"] = previous.get("start_iteration", 0)
+                cost_record["notes"].append(
+                    "Contiguous resumed sessions were accumulated without recounting rollout samples."
+                )
+        write_cost_record(cost_path, cost_record)
+        print(f"Saved post-specialist training-cost audit to {self.log_dir}/training_cost.json")
 
     def _log_distill(
         self,
