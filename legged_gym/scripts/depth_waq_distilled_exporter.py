@@ -101,7 +101,7 @@ if __name__ == "__main__":
     # This is a single distilled student, not the multi-specialist FFT policy.
     run_dir = os.path.join(
         LEGGED_GYM_ROOT_DIR,
-        "logs/go2_depth_waq_multiteacher_lora_distill/Sep05_12-57-33_pure_imitation",
+        "logs/go2_depth_waq_multiteacher_distill/Sep05_12-57-33_pure_imitation",
     )
     actor_critic = load_checkpoint(
         ActorCriticDreamWaQDepth,
@@ -112,7 +112,7 @@ if __name__ == "__main__":
 
     path = os.path.join(LEGGED_GYM_ROOT_DIR, "exported")
     os.makedirs(path, exist_ok=True)
-    path = os.path.join(path, timestamp)
+    path = os.path.join(path, f"{timestamp}_distilled")
     os.makedirs(path, exist_ok=True)
     file = os.path.join(path, f"compiled_distilled_{timestamp}.pt")
     exporter.export(file)

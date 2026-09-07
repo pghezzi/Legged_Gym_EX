@@ -273,11 +273,11 @@ class Go2DepthWaqDistillCfgPPO(Go2DepthWaqCfgPPO):
         algorithm_class_name = "PPO_WAQ_Distill"
 
         experiment_name = (
-            "go2_depth_waq_multiteacher_lora_distill"
+            "go2_depth_waq_multiteacher_distill"
         )
         run_name = "pure_imitation"
 
-        max_iterations = 10000
+        max_iterations = 20000
         save_interval = 500
 
         # Set this only if you later want to initialize the student from an

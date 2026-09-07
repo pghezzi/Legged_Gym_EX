@@ -229,6 +229,10 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                 feet_near_edge = -1.0
                 feet_air_time = 0.6
                 alive = 1
+            
+            if terrain_name == "gap":
+                torque_limits = -0.1
+                dof_vel = -0.0001
     class commands( LeggedRobotDreamwaqCfg.commands ):
         curriculum = True
         if terrain_name in ("baseline"):

@@ -530,7 +530,7 @@ def parse_args(argv=None):
     parser.add_argument("--task", default="go2_depth_waq")
     parser.add_argument("--gpu", default="cuda:0")
     parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--headless", action="store_true", default=True)
+    parser.add_argument("--headless", action="store_true", default=False)
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     parser.add_argument("--difficulties", nargs="+", choices=DIFFICULTIES, default=list(DIFFICULTIES))
     parser.add_argument("--eval-seeds", nargs="+", type=int, default=list(EVAL_SEEDS))

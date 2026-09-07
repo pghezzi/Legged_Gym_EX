@@ -303,7 +303,7 @@ def override_configs(env_cfg, args):
         },
         "pit": {
             "type": "terrain_utils.pit_terrain",
-            "depth": 0.15,
+            "depth": 0.52,
             "platform_size": 3.0,
         },
         "multiple_high_platforms" : {
@@ -755,9 +755,9 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         requested_mode = None
         lock = threading.Lock()
         import copy
-        policy_tester = torch.jit.load(args.jit,  'cpu')
-        policy_tester.swap(policy_tester.num_of_loras - 1)
-        policy_tester.swap(-1)
+        #policy_tester = torch.jit.load(args.jit,  'cpu')
+        #policy_tester.swap(policy_tester.num_of_loras - 1)
+        #policy_tester.swap(-1)
         #def keyboard_thread():
         #    nonlocal requested_mode
         #    while True:
@@ -825,7 +825,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
     #env._resample_commands(torch.arange(env.num_envs))
     cho = torch.tensor([0, 3.14/2, 3.14, -3.14/2, -3.14])
     commands = torch.zeros_like(env.commands)
-    commands[:, 0] = 1
+    commands[:, 0] = 0
     commands[:, 1] = 0
     commands[:, 2] = 0
     commands[:, 3] = cho[torch.randint(0, cho.shape[0], (env.num_envs,))]
@@ -927,6 +927,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             actions = policy(estimator_features.detach())
             estimator_features, estimator_labels, _, rews, dones, infos = env.step(actions.detach())
         elif "depth_waq" in task_name:
+            #print(obs_buf.shape, obs_history.shape, depth.shape)
             actions = policy(obs_buf, obs_history, depth)
             #if policy1 is not None:
             #    print(f"{torch.sum(torch.abs(actions - policy1(obs_buf, obs_history, depth)))}")
@@ -1082,7 +1083,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
     def terrain_keys(label):
         if "stairs" in label:
             return "stairs"
-        elif "pit" in label:
+        elif "pit" in label or "center_platform" in label:
             return "pit"
         return label
 
@@ -1321,6 +1322,34 @@ class multi_jit:
     def swap(self, index):
         pass
 
+
+class normal_jit:
+    def __init__(self, policy):
+        """
+        policy:
+            Your existing JIT policy containing the different policies.
+
+        terrain_keys:
+            TERRAIN_KEYS, e.g.
+            {
+                0: "gap",
+                1: "stairs",
+                2: "pit",
+                ...
+            }
+        """
+        self.policy = policy
+
+
+    def __call__(self, obs_buf, obs_history, depth):
+        return self.policy(obs_buf, obs_history, depth)
+
+    def set_labels(self, labels):
+        pass
+    
+    def swap(self, index):
+        pass
+
 class multi_policy:
     def __init__(self, policies, terrain_keys):
         """
@@ -1439,7 +1468,11 @@ def play(args):
     
     if args.jit:
         policy1 = policy
-        policy = multi_jit(torch.jit.load(args.jit,  map_location=args.gpu if not args.cpu else 'cpu'), TERRAIN_KEYS)
+        policy = torch.jit.load(args.jit,  map_location=args.gpu if not args.cpu else 'cpu')
+        if hasattr(policy, 'swap'):
+            policy = multi_jit(policy, TERRAIN_KEYS)
+        else:
+            policy = normal_jit(policy)
         policy.set_labels(torch.tensor([1]*env.num_envs))
     elif args.multitask:
         from rsl_rl.utils.runner_registry import runner_registry
