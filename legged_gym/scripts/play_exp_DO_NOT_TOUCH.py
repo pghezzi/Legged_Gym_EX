@@ -206,6 +206,8 @@ def get_args():
     parser.add_argument('--baysian_filter', type=str, default='', help="test a terrain detector")
 
     parser.add_argument('--command_test_suite', action='store_true', default=False, help="run a simple commnad test suite")
+    parser.add_argument('--command_forward', type=float, default=None,
+                        help="override commands with [forward, 0, 0, 0]; omit to use normal commands")
     parser.add_argument('--explore', action='store_true', default=False, help="explore terrain")
 
     parser.add_argument('--multitask', type=str, nargs='+', default=None, help="list of tasks to run/train on")
@@ -871,6 +873,12 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
                 commands[:, 1] = 0
                 commands[:, 2] = 0
                 commands[:, 3] = env.heading
+
+        if args.command_forward is not None:
+            env.commands[:, 0] = args.command_forward
+            env.commands[:, 1] = 0
+            env.commands[:, 2] = 0
+            env.commands[:, 3] = 0
 
         #print(env.commands)
         #print(env.commands)
