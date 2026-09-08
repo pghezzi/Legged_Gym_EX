@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import random
 import time
@@ -46,6 +47,15 @@ from .util_func import (
     probability_metrics,
     save_results,
     sequence_ids_for,
+)
+from rsl_rl.utils.training_cost import (
+    WallTimer,
+    artifact_size_mb,
+    cuda_device_info,
+    peak_memory_mb,
+    provenance_map,
+    reset_peak_memory,
+    write_cost_record,
 )
 
 
@@ -326,6 +336,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise ValueError(f"{name} contains labels absent from training: {sorted(unknown, key=str)}")
     ordered_ids = sequence_ids_for(ordered_test)
 
+    reset_peak_memory(device)
+    preprocessing_timer = WallTimer(device).start()
     extractor = make_terrain_extractor(structural_dir / "calibration.pt")
     train_features = extract_dataset_features(extractor, train, chunk_size=args.batch_size)
     validation_features = extract_dataset_features(extractor, validation, chunk_size=args.batch_size)
@@ -336,6 +348,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     feature_artifacts.mkdir(parents=True, exist_ok=True)
     extractor.save(feature_artifacts / "extractor.pt")
     standardizer.save(feature_artifacts / "standardizer.pt")
+    feature_preprocessing_s = preprocessing_timer.stop()
+    feature_preprocessing_peak_mb = peak_memory_mb(device)
 
     experiment_1_rows, experiment_2_rows, training_records = [], [], []
     raw_train = raw_validation = None
@@ -344,11 +358,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         if architecture == "raw_depth_nn":
             # Match the existing raw-depth trainer while avoiding a second copy
             # of these large packed inputs during all feature-NN runs.
+            reset_peak_memory(device)
+            preprocessing_timer = WallTimer(device).start()
             raw_train = pack_raw_depth_state_inputs(
                 train["depth_images"], train["orientation_rpy"], train["angular_velocity"])
             raw_validation = pack_raw_depth_state_inputs(
                 validation["depth_images"], validation["orientation_rpy"],
                 validation["angular_velocity"])
+            raw_preprocessing_s = preprocessing_timer.stop()
+            raw_preprocessing_peak_mb = peak_memory_mb(device)
         for seed in MODEL_SEEDS:
             _set_seed(seed)
             if architecture == "feature_nn":
@@ -364,7 +382,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 train_inputs, validation_inputs = raw_train, raw_validation
             classifier = NeuralClassifierAdapter(model, class_ids, fit_callback=fit_nn, device=device)
             classifier.require_feature = architecture == "feature_nn"
-            started = time.perf_counter()
+            reset_peak_memory(device)
+            optimization_timer = WallTimer(device).start()
             classifier.fit(
                 train_inputs, train["labels"], val=(validation_inputs, validation["labels"]),
                 epochs=MAX_EPOCHS, batch_size=args.batch_size,
@@ -372,26 +391,94 @@ def main(argv: Sequence[str] | None = None) -> None:
                 optimizer_kwargs={"weight_decay": config["weight_decay"]},
                 early_stopping_patience=EARLY_STOPPING_PATIENCE,
                 restore_best_weights=True, verbose=not args.quiet_training)
-            training_seconds = time.perf_counter() - started
+            training_seconds = optimization_timer.stop()
 
             seed_dir = output / "artifacts" / architecture / f"seed_{seed}"
             seed_dir.mkdir(parents=True, exist_ok=True)
             model_path = seed_dir / "classifier.pt"
             args_path = seed_dir / "nn_model_args.pt"
             history_path = seed_dir / "training_history.json"
+            serialization_timer = WallTimer(device).start()
             classifier.save(model_path)
             torch.save(model.get_args(), args_path)
             save_results(history_path, classifier.training_history)
-            training_records.append({
+            serialization_s = serialization_timer.stop()
+            preprocessing_s = (
+                feature_preprocessing_s if architecture == "feature_nn" else raw_preprocessing_s
+            )
+            epochs_completed = int(classifier.training_history["epochs_completed"])
+            optimization_peak_mb = peak_memory_mb(device)
+            preprocessing_peak_mb = (
+                feature_preprocessing_peak_mb if architecture == "feature_nn"
+                else raw_preprocessing_peak_mb
+            )
+            cost_record = {
+                "schema_version": 1,
+                "run_type": "classifier_training",
+                "method": "Feature Router" if architecture == "feature_nn" else "Raw-Depth Router",
                 "architecture": architecture, "seed": seed, "model_path": str(model_path),
                 "model_args_path": str(args_path), "training_history_path": str(history_path),
                 "dropout_p": config["dropout_p"], "weight_decay": config["weight_decay"],
                 "training_runtime_seconds": training_seconds,
-                "epochs_completed": classifier.training_history["epochs_completed"],
+                "training_samples": len(train["labels"]),
+                "validation_samples": len(validation["labels"]),
+                "test_samples": len(structural_test["labels"]),
+                "batch_size": args.batch_size,
+                "epochs_completed": epochs_completed,
+                "optimizer_updates": int(classifier.training_history.get(
+                    "optimizer_updates",
+                    epochs_completed * math.ceil(len(train["labels"]) / args.batch_size))),
                 "best_epoch": classifier.training_history["best_epoch"],
+                "best_epoch_one_based": None if classifier.training_history["best_epoch"] is None
+                else int(classifier.training_history["best_epoch"]) + 1,
+                "early_stopping_epoch": epochs_completed if classifier.training_history["stopped_early"] else None,
                 "stopped_early": classifier.training_history["stopped_early"],
                 "best_weights_restored": classifier.training_history["best_weights_restored"],
-            })
+                "preprocessing_s": preprocessing_s,
+                "optimization_s": training_seconds,
+                "artifact_serialization_s": serialization_s,
+                "total_classifier_training_s": preprocessing_s + training_seconds + serialization_s,
+                "total_wallclock_s": preprocessing_s + training_seconds + serialization_s,
+                "gpu_active_time_s": None,
+                "gpu_hours": (preprocessing_s + training_seconds + serialization_s) / 3600.0
+                if torch.device(device).type == "cuda" else 0.0,
+                "peak_gpu_memory_mb": max(
+                    value for value in (preprocessing_peak_mb, optimization_peak_mb)
+                    if value is not None
+                ) if torch.device(device).type == "cuda" else None,
+                "trainable_params": sum(parameter.numel() for parameter in model.parameters()
+                                        if parameter.requires_grad),
+                "checkpoint_size_mb": artifact_size_mb(model_path),
+                "artifact_size_mb": artifact_size_mb(model_path) + artifact_size_mb(args_path) + (
+                    artifact_size_mb(feature_artifacts / "extractor.pt")
+                    + artifact_size_mb(feature_artifacts / "standardizer.pt")
+                    if architecture == "feature_nn" else 0.0),
+                "data_env_steps": 0,
+                "data_generation_s": 0.0,
+                "additional_locomotion_policy_training": False,
+                "additional_locomotion_policy_env_steps": 0,
+                "total_post_specialist_env_steps": 0,
+                "ema_training_s": 0.0,
+                "bayes_training_s": 0.0,
+                **cuda_device_info(device),
+                "notes": [
+                    "Specialist locomotion policies are pre-existing and excluded.",
+                    "Feature generation/prepacking was measured once and is reported for each independent seed.",
+                    "GPU-hours are synchronized allocated-device wall-clock; kernel-active time requires an external profiler.",
+                    "Optimizer updates are counted at each optimizer.step call.",
+                ],
+            }
+            cost_record["metric_status"] = provenance_map(cost_record)
+            cost_record["metric_status"]["optimizer_updates"] = (
+                "measured" if "optimizer_updates" in classifier.training_history
+                else "reconstructed"
+            )
+            cost_record["metric_status"]["gpu_active_time_s"] = "unavailable"
+            cost_record["metric_status"]["gpu_hours"] = (
+                "reconstructed" if torch.device(device).type == "cuda" else "measured"
+            )
+            write_cost_record(seed_dir / "training_cost.json", cost_record)
+            training_records.append(cost_record)
 
             if architecture == "feature_nn":
                 structural_logits, structural_runtime = collect_engineered_logits(

@@ -7,12 +7,23 @@ from legged_gym.utils import *
 
 import numpy as np
 import torch
+import time
 
 from legged_gym.utils.exp_data_logger import ExpLogger
 from legged_gym.utils.terrain_vars import TERRAIN_INDEX, TERRAIN_KEYS
 import argparse
 
 import cv2
+
+from rsl_rl.utils.training_cost import (
+    artifact_size_mb,
+    cuda_device_info,
+    peak_memory_mb,
+    provenance_map,
+    reset_peak_memory,
+    synchronize,
+    write_cost_record,
+)
 
 def get_viewed_terrain_idx(env, look_ahead_frac: float = 0.2):
     """
@@ -732,6 +743,9 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         base_ang_vel_log = []
         resets_log = []
         terrain_name_log = []
+        executed_control_steps = 0
+        completed_episodes = torch.zeros((), dtype=torch.long, device=env.device)
+        collected_depth_samples = 0
     
     # Get initial observations according to task type
     task_name = args.task
@@ -833,6 +847,9 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
     commands[:, 3] = cho[torch.randint(0, cho.shape[0], (env.num_envs,))]
     if args.save_depth_classifier_data:
         print(f"Num of samples generated: {(10* 1000 * env.num_envs) / 5} (aprox)")
+        reset_peak_memory(env.device)
+        collection_total_started = time.perf_counter()
+        collection_started = collection_total_started
     #(10* 1000 * 100) / 5 = 2000
     for i in range(int(10.00*env.max_episode_length)):
         if not args.headless and args.follow_robot:
@@ -949,6 +966,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
                     depth_images_log.append(env.depth_sensor_output.detach().cpu().clone())
                     base_rpy_log.append(env.simulator._base_euler.detach().cpu().clone())
                     base_ang_vel_log.append(env.simulator.base_ang_vel.detach().cpu().clone())
+                    collected_depth_samples += int(env.depth_sensor_output.shape[0])
                 if args.terrain_detector:
                     _depth = env.depth_sensor_output
                     _euler = env.simulator._base_euler.detach()
@@ -1012,6 +1030,10 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         if i % 5 == 0 and args.save_depth_classifier_data and args.filter_depth_classifier_data:
             resets_log.append(dones)
 
+        if args.save_depth_classifier_data:
+            executed_control_steps += 1
+            completed_episodes += torch.count_nonzero(dones)
+
         #if dones[0] == True:
         #    if args.terrain_detector:
         #        terrain_detector.reset_temporal_filter()
@@ -1064,6 +1086,9 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         #        'feet_pos':env.simulator.feet_pos.detach().cpu().numpy().tolist(),
         #        'failure':list(map(int, env.get_failure_idx().detach().cpu().numpy().tolist())),
         #    })
+    if args.save_depth_classifier_data:
+        synchronize(env.device)
+        collection_wallclock_s = time.perf_counter() - collection_started
     if "depth_waq" in task_name and not args.no_depth_cam:
         cv2.destroyAllWindows()
     
@@ -1183,11 +1208,68 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             "filtered": args.filter_depth_classifier_data
         }, save_path)
 
+        synchronize(env.device)
+        total_wallclock_s = time.perf_counter() - collection_total_started
+        completed_episode_count = int(completed_episodes.item())
+        device_info = cuda_device_info(env.device)
+        control_frequency_hz = 1.0 / float(env.dt)
+        simulation_frequency_hz = 1.0 / float(env.cfg.sim.dt)
+        environment_steps = executed_control_steps * int(env.num_envs)
+        cost_record = {
+            "schema_version": 1,
+            "run_type": "classifier_data_collection",
+            "method": "Shared Router Data Collection",
+            "source_script": os.path.abspath(__file__),
+            "task": args.task,
+            "seed": args.seed,
+            "dataset_path": save_path,
+            "dataset_size_mb": artifact_size_mb(save_path),
+            "artifact_size_mb": artifact_size_mb(save_path),
+            "control_steps": executed_control_steps,
+            "environment_steps": environment_steps,
+            "simulator_substeps": environment_steps * int(env.cfg.control.decimation),
+            "data_env_steps": environment_steps,
+            "additional_locomotion_policy_training": False,
+            "additional_locomotion_policy_env_steps": 0,
+            "total_post_specialist_env_steps": environment_steps,
+            "trajectories_started": int(env.num_envs) + completed_episode_count,
+            "episodes_completed": completed_episode_count,
+            "training_samples": collected_depth_samples,
+            "collected_depth_frames": collected_depth_samples,
+            "saved_samples": int(depth_images_tensor.shape[0] * depth_images_tensor.shape[1]),
+            "num_parallel_envs": int(env.num_envs),
+            "control_frequency_hz": control_frequency_hz,
+            "simulation_frequency_hz": simulation_frequency_hz,
+            "data_generation_s": collection_wallclock_s,
+            "preprocessing_s": 0.0,
+            "optimization_s": 0.0,
+            "total_wallclock_s": total_wallclock_s,
+            "gpu_active_time_s": None,
+            "gpu_hours": total_wallclock_s / 3600.0 if device_info["gpu_count"] else 0.0,
+            "peak_gpu_memory_mb": peak_memory_mb(env.device),
+            "trainable_params": 0,
+            **device_info,
+            "notes": [
+                "Accounting starts immediately before the unchanged interaction loop and ends after dataset serialization.",
+                "Environment steps count vectorized control transitions; simulator_substeps additionally applies control decimation.",
+                "GPU-hours are synchronized allocated-device wall-clock; kernel-active time requires an external profiler.",
+                "Specialist-policy training is excluded.",
+            ],
+        }
+        cost_record["metric_status"] = provenance_map(cost_record)
+        cost_record["metric_status"]["gpu_active_time_s"] = "unavailable"
+        cost_record["metric_status"]["gpu_hours"] = (
+            "reconstructed" if device_info["gpu_count"] else "measured"
+        )
+        cost_path = save_path + ".training_cost.json"
+        write_cost_record(cost_path, cost_record)
+
         print(f"Saved depth images {tuple(depth_images_tensor.shape)}, "
           f"base rpy {tuple(base_rpy_tensor.shape)}, "
           f"base ang vel {tuple(base_ang_vel_tensor.shape)}, "
           f"terrain name list {get_shape(labels_list)}"
           f"and terrain name to: {save_path}")
+        print(f"Saved collection-cost audit to: {cost_path}")
         print(save_path)
 
 def export_policy(alg_runner, path: str, args, env_cfg, train_cfg):

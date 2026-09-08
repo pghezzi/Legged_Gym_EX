@@ -5,10 +5,17 @@ from legged_gym import *
 from legged_gym.envs import *
 from legged_gym.utils import get_args, task_registry
 import shutil
+import time
+import torch
 
 from legged_gym.scripts.expand_config import reconstruct_config_file
 
 def train(args):
+    post_specialist_started = (
+        time.perf_counter() if "distill" in args.task.lower() else None
+    )
+    if post_specialist_started is not None and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     if SIMULATOR == "genesis":
         gs.init(
             backend=gs.cpu if args.cpu else gs.gpu,
@@ -17,6 +24,11 @@ def train(args):
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
     
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
+    if (post_specialist_started is not None
+            and hasattr(ppo_runner, "_post_specialist_started")):
+        # Include environment construction in the distillation-only accounting
+        # boundary without affecting any runner's training behavior.
+        ppo_runner._post_specialist_started = post_specialist_started
     # Copy env.py and env_config.py to log_dir for backup
     log_dir = ppo_runner.log_dir
     if not os.path.exists(log_dir):

@@ -1857,7 +1857,8 @@ def fit_nn(
         opt = optimizer(adapter.model.parameters(), lr=lr, **kwargs)
     criterion = nn.CrossEntropyLoss()
     history: Dict[str, Any] = {
-        "train_loss": [], "train_accuracy": [], "validation_loss": [], "validation_accuracy": []
+        "train_loss": [], "train_accuracy": [], "validation_loss": [], "validation_accuracy": [],
+        "optimizer_updates": 0,
     }
     best_state, best_loss, best_epoch, stale_epochs = None, float("inf"), None, 0
     stopped_early = False
@@ -1873,6 +1874,7 @@ def fit_nn(
             loss = criterion(logits, y_batch)
             loss.backward()
             opt.step()
+            history["optimizer_updates"] += 1
             total += y_batch.numel()
             loss_sum += float(loss.detach()) * y_batch.numel()
             correct += int((logits.detach().argmax(1) == y_batch).sum())

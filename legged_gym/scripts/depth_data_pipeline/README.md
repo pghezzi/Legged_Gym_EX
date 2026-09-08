@@ -162,3 +162,24 @@ Use `--classifier-data` and `--ordered-data` for nonstandard structural/ordered
 folder layouts. The output contains per-seed and mean/std CSV/JSON metrics,
 checkpoints and preprocessing artifacts, a reproducibility manifest, and the
 initial Experiment 1--2 figures.
+
+## Post-specialist training-cost audit
+
+New classifier collection runs, frozen offline classifier runs, and multi-skill
+distillation runs write training-cost JSON sidecars without changing their
+training behavior. Aggregate three classifier seeds and up to three distillation
+seeds with:
+
+```bash
+python -m legged_gym.scripts.depth_data_pipeline.summarize_training_costs \
+  --paper-offline-dir paper_offline_eval \
+  --collection-cost /path/to/capture.pt.training_cost.json \
+  --distillation-run /path/to/distill_seed_0 /path/to/distill_seed_1 /path/to/distill_seed_2 \
+  --output training_cost_audit
+```
+
+The report uses the common boundary from frozen specialist policies to a
+deployable router or unified student. Every cost carries measured,
+reconstructed, or unavailable provenance; teacher-labelled distillation
+rollouts are counted once even though they serve both data generation and
+student-policy training.
