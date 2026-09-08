@@ -150,7 +150,9 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         feet_edge_threshold = 0.05 # distance threshold below which foot is considered to be near the edge of a terrain
         class scales:
             base_height = -1.0
-            torque_limits = -0.001
+            #torque_limits = -0.001
+            torque_limits = -0.1
+            dof_vel = -0.0001
             if terrain_name in ("baseline"):
                 # limitation
                 dof_pos_limits = -2.0
@@ -229,10 +231,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                 feet_near_edge = -1.0
                 feet_air_time = 0.6
                 alive = 1
-            
-            if terrain_name == "gap":
-                torque_limits = -0.1
-                dof_vel = -0.0001
+                
     class commands( LeggedRobotDreamwaqCfg.commands ):
         curriculum = True
         if terrain_name in ("baseline"):
