@@ -71,7 +71,25 @@ class DreamWaQDepthRunner(OnPolicyRunner):
             self.parkour_auxiliary.save(os.path.join(directory, os.path.basename(path)))
 
     def load(self, path, load_optimizer=True):
+        # One-off recovery for older checkpoints whose stored iteration is stale.
+        # This is an absolute stopping iteration, not additional training steps.
+        resume_until = os.environ.get("DEPTHWAQ_RESUME_UNTIL", "")
+        filename_iteration = None
+        if resume_until:
+            filename = os.path.basename(path)
+            if not (filename.startswith("model_") and filename.endswith(".pt")
+                    and filename[6:-3].isdigit()):
+                raise ValueError("DEPTHWAQ_RESUME_UNTIL requires a model_<iteration>.pt checkpoint")
+            filename_iteration = int(filename[6:-3])
+            resume_until = int(resume_until)
+            if resume_until <= filename_iteration:
+                raise ValueError("DEPTHWAQ_RESUME_UNTIL must exceed the checkpoint filename iteration")
         infos = super().load(path, load_optimizer)
+        self._resume_until = resume_until if filename_iteration is not None else None
+        if filename_iteration is not None:
+            print(f"Resume override: saved iteration {self.current_learning_iteration} -> "
+                  f"filename iteration {filename_iteration}; finish at {resume_until}.")
+            self.current_learning_iteration = filename_iteration
         if self.parkour_auxiliary is not None:
             sidecar = os.path.join(os.path.dirname(path), "auxiliary", os.path.basename(path))
             if os.path.isfile(sidecar):
@@ -104,6 +122,12 @@ class DreamWaQDepthRunner(OnPolicyRunner):
                               [self.env.num_decoder_output], [self.env.num_actions], [1, *self.env.output_resolution])
     
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        if getattr(self, "_resume_until", None) is not None:
+            num_learning_iterations = self._resume_until - self.current_learning_iteration
+            if num_learning_iterations <= 0:
+                raise ValueError("The requested resume finish iteration has already been reached")
+            print(f"Resuming {self.current_learning_iteration}/{self._resume_until}: "
+                  f"{num_learning_iterations} additional iterations.")
         self._pre_learn(init_at_random_ep_len)
         obs, privileged_obs, obs_history, explicit_info_labels, next_state, depth_image = self.env.get_observations()
         obs, privileged_obs, obs_history, explicit_info_labels, next_state, depth_image = obs.to(self.device), privileged_obs.to(self.device), \
@@ -160,7 +184,7 @@ class DreamWaQDepthRunner(OnPolicyRunner):
             if self.log_dir is not None:
                 self.log(locals())
             if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)), cur_iter=it)
             ep_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations

@@ -777,7 +777,7 @@ class LeggedRobot(BaseTask):
         return torch.sum((torch.abs(self.simulator.dof_vel) - self.simulator.dof_vel_limits*self.cfg.rewards.soft_dof_vel_limit).clip(min=0., max=1.), dim=1)
 
     def _reward_torque_limits(self) -> Reward:
-        # Penalize requested torque, so demand beyond saturation remains visible.
+        # Penalize applied torque above the soft limit (after command clipping).
         return torch.sum((torch.abs(self.simulator.unclipped_torques) - self.simulator.torque_limits*self.cfg.rewards.soft_torque_limit).clip(min=0.), dim=1)
 
     def _reward_tracking_lin_vel(self) -> Reward:

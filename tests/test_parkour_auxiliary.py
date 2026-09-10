@@ -265,7 +265,7 @@ def test_storage_exposes_exact_minibatch_indices_without_changing_tuple():
         torch.testing.assert_close(batch[-1][:, 0, 0, 0], target)
 
 
-def test_runner_sidecar_preserves_legacy_checkpoint_and_load_selection(tmp_path):
+def checkpoint_runner_class():
     # Execute the real save/load methods without importing the simulator registry.
     namespace = dict(torch=torch, os=os, Any=Any, Dict=Dict, Optional=Optional)
     for filename, name in (("on_policy_runner.py", "OnPolicyRunner"),
@@ -273,9 +273,22 @@ def test_runner_sidecar_preserves_legacy_checkpoint_and_load_selection(tmp_path)
         path = Path(__file__).parents[1] / "rsl_rl/runners" / filename
         tree = ast.parse(path.read_text())
         node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
-        node.body = [n for n in node.body if isinstance(n, ast.FunctionDef) and n.name in ("save", "load")]
-        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
-    DreamWaQDepthRunner = namespace["DreamWaQDepthRunner"]
+        node.body = [n for n in node.body if isinstance(n, ast.FunctionDef) and n.name in ("save", "load", "learn")]
+        # Exercise the real budget calculation, stopping before simulator setup.
+        for method in node.body:
+            if method.name == "learn":
+                stop = next(i for i, stmt in enumerate(method.body) if isinstance(stmt, ast.Expr)
+                            and isinstance(stmt.value, ast.Call)
+                            and getattr(stmt.value.func, "attr", None) == "_pre_learn")
+                method.body = method.body[:stop] + [ast.Return(ast.Name("num_learning_iterations", ast.Load()))]
+        tree = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+        exec(compile(tree, str(path), "exec"), namespace)
+    return namespace["DreamWaQDepthRunner"]
+
+
+def test_runner_sidecar_preserves_legacy_checkpoint_and_load_selection(tmp_path, monkeypatch):
+    monkeypatch.delenv("DEPTHWAQ_RESUME_UNTIL", raising=False)
+    DreamWaQDepthRunner = checkpoint_runner_class()
     model, alg, aux = make_aux()
     runner = DreamWaQDepthRunner.__new__(DreamWaQDepthRunner)
     runner.alg, runner.parkour_auxiliary = alg, aux
@@ -298,3 +311,38 @@ def test_runner_sidecar_preserves_legacy_checkpoint_and_load_selection(tmp_path)
     runner.parkour_auxiliary = None
     runner.load(str(path))
     model.load_state_dict(state["model_state_dict"], strict=True)
+
+
+def test_opt_in_resume_uses_filename_and_absolute_finish(tmp_path, monkeypatch):
+    runner_class = checkpoint_runner_class()
+    model, alg, aux = make_aux()
+    runner = runner_class.__new__(runner_class)
+    runner.alg, runner.parkour_auxiliary = alg, aux
+    runner.current_learning_iteration = 10000
+    path = tmp_path / "model_16500.pt"
+    runner.save(str(path))  # reproduce the old incorrect metadata
+    original_bytes = path.read_bytes()
+    monkeypatch.setenv("DEPTHWAQ_RESUME_UNTIL", "50000")
+    runner.load(str(path))
+    assert runner.current_learning_iteration == 16500
+    assert runner.learn(40000) == 33500
+    assert path.read_bytes() == original_bytes
+    # Disabling the override restores the previous loading/budget semantics.
+    monkeypatch.delenv("DEPTHWAQ_RESUME_UNTIL")
+    runner.load(str(path))
+    assert runner.current_learning_iteration == 10000
+    assert runner.learn(40000) == 40000
+    # The corrected periodic-save call records the actual loop iteration.
+    runner.save(str(path), cur_iter=16500)
+    assert torch.load(path, weights_only=False)["iter"] == 16500
+
+
+@pytest.mark.parametrize("filename,finish", [("model_latest.pt", "50000"),
+                                           ("model_16500.pt", "16500"),
+                                           ("model_16500.pt", "bad")])
+def test_resume_override_rejects_invalid_input_before_loading(tmp_path, monkeypatch, filename, finish):
+    runner_class = checkpoint_runner_class()
+    runner = runner_class.__new__(runner_class)
+    monkeypatch.setenv("DEPTHWAQ_RESUME_UNTIL", finish)
+    with pytest.raises(ValueError):
+        runner.load(str(tmp_path / filename))

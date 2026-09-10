@@ -147,13 +147,14 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
 
         class reward_curriculum:
             # PACT schedule plus joint-velocity penalties; absent terms are skipped.
-            curr_reward_keys = ["torque_limits",
+            curr_reward_keys = [
+                                "torque_limits",
                                 "dof_vel",
                                 "dof_vel_limits"]
             curr_reward_bounds = {
-                "torque_limits": [-0.01, -0.1],
-                "dof_vel": [-0.0001, -0.001],
-                "dof_vel_limits": [-0.001, -0.1],
+                "torque_limits": [-0.01, -0.012],
+                "dof_vel": [-0.00001, -0.0001],
+                "dof_vel_limits": [-0.01, -0.1],
             }
             warmup_steps = 10000
             curr_steps = 10000
@@ -161,6 +162,8 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         soft_dof_pos_limit = 0.9
         soft_dof_vel_limit = 0.9
         base_height_target = 0.38
+        # Standard GAP takeoff/landing surfaces share the terrain origin height.
+        base_height_relative_to_gap_landing = terrain_name == "gap"
         foot_clearance_target = 0.08 # desired foot clearance above ground [m]
         foot_height_offset = 0.022   # height of the foot coordinate origin above ground [m]
         foot_clearance_tracking_sigma = 0.01
@@ -173,7 +176,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         class scales:
             base_height = -1.0
             #torque_limits = -0.001
-            torque_limits = -0.1
+            torque_limits = -0.01
             dof_vel_limits = -0.01
             dof_vel = -0.0001
             if terrain_name in ("baseline"):
@@ -451,5 +454,14 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
 # export SIMULATOR=isaacgym
 # export TERRAIN=gap
 # export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_baseline/Sep09_05-49-24_dreamwaq_isaacgym/model_10000.pt
+
+# python -m legged_gym.scripts.train --task go2_depth_waq --headless
+
+
+# NEW Resume logic!
+# export DEPTHWAQ_RESUME_UNTIL=50000
+# export TERRAIN=gap
+# export PARKOUR_AUX=1
+# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep10_03-44-19_dreamwaq_isaacgym/model_16500.pt
 
 # python -m legged_gym.scripts.train --task go2_depth_waq --headless

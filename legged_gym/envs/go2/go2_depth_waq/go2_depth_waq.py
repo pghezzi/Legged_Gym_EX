@@ -494,6 +494,15 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
 
         return torch.exp(-total_err / self.cfg.rewards.foot_clearance_tracking_sigma)
     
+    def _reward_base_height(self):
+        # Only dedicated GAP training: inherited mixed-terrain tasks retain the
+        # original reward. The standard gap's two landing surfaces are coplanar.
+        if (getattr(self.cfg.rewards, "base_height_relative_to_gap_landing", False)
+                and self.cfg.terrain.terrain_proportions[6] == 1.0):
+            base_height = self.simulator.base_pos[:, 2] - self.simulator.env_origins[:, 2]
+            return torch.square(base_height - self.cfg.rewards.base_height_target)
+        return super()._reward_base_height()
+
     def _reward_hip_pos(self):
         """ Reward for the hip joint position close to default position
         """
