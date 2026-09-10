@@ -148,13 +148,10 @@ class PPO_DreamWaQ_Depth(PPO):
             num_envs, num_cam_envs, num_transitions_per_env, actor_obs_shape, 
             privileged_obs_shape, obs_history_shape, explicit_info_shape, next_states_shape, action_shape, depth_image_shape, self.device)
 
-    def process_env_step(self, rewards, dones, infos, next_state, depth_image):
+    def process_env_step(self, rewards, dones, infos, next_state):
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
         self.transition.next_states = next_state.clone()
-        #####
-        self.transition.depth_images = depth_image.clone()
-        ####
         # Bootstrapping on time outs
         if 'time_outs' in infos:
             self.transition.rewards += self.gamma * \
@@ -170,7 +167,10 @@ class PPO_DreamWaQ_Depth(PPO):
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute the actions and values
-        self.transition.actions = self.actor_critic.act(obs, obs_history, depth_image).detach()
+        self.transition.depth_images = depth_image.detach().clone()
+        self.transition.actions = self.actor_critic.act(
+            obs, obs_history, self.transition.depth_images
+        ).detach()
         self.transition.values = self.actor_critic.evaluate(privileged_obs).detach()
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(
             self.transition.actions).detach()

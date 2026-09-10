@@ -566,6 +566,15 @@ class Simulator(ABC):
         return self._torques
     
     @property
+    def unclipped_torques(self):
+        """Requested torques before saturation, in configured joint order.
+
+        Backends without command clipping (Genesis) already expose these
+        through torques. Clipping backends override this property.
+        """
+        return self.torques
+
+    @property
     def torque_limits(self):
         """Returns the torque limits of the robot's joints.
 

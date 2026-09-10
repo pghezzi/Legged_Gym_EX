@@ -1,9 +1,12 @@
+# syntax=docker/dockerfile:1
 # =============================================================================
 # LeggedGym-Ex Dockerfile (IsaacGym)
 # =============================================================================
 # 构建命令：
-#   cd /home/lupinjia
-#   docker build -t leggedgym-ex:isaacgym -f LeggedGym-Ex/Dockerfile.isaacgym .
+#   cd /path/to/Legged_Gym_EX
+#   docker buildx build --load \
+#     --build-context isaacgym=/path/to/isaacgym \
+#     -t leggedgym-ex:isaacgym -f Dockerfile.isaacgym .
 #
 # 运行命令：
 #   docker run --gpus all -it --rm leggedgym-ex:isaacgym
@@ -53,10 +56,10 @@ RUN uv python install 3.8
 WORKDIR /workspace
 
 # ---- 复制 IsaacGym ----
-COPY isaacgym /workspace/isaacgym
+COPY --from=isaacgym / /workspace/isaacgym
 
 # ---- 复制项目源码 ----
-COPY LeggedGym-Ex /workspace/LeggedGym-Ex
+COPY . /workspace/LeggedGym-Ex
 
 # ---- 创建并安装 IsaacGym 环境 ----
 RUN --mount=type=cache,target=/root/.cache/uv \

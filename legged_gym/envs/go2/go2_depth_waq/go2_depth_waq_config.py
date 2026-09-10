@@ -135,9 +135,31 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         #    terminate_after_contacts_on = ["Head"]
         #termination_count = 100
         #pass
+
+        # For Genesis
+        links_to_keep = ['FL_foot', 'FR_foot', 'RL_foot', 'RR_foot']
+        dof_vel_limits = [30.1, 30.1, 15.7, 
+                          30.1, 30.1, 15.7, 
+                          30.1, 30.1, 15.7, 
+                          30.1, 30.1, 15.7]
     class rewards( Go2RoughCommonCfg.rewards ):
+        use_reward_curriculum = True
+
+        class reward_curriculum:
+            # PACT schedule plus joint-velocity penalties; absent terms are skipped.
+            curr_reward_keys = ["torque_limits",
+                                "dof_vel",
+                                "dof_vel_limits"]
+            curr_reward_bounds = {
+                "torque_limits": [-0.01, -0.1],
+                "dof_vel": [-0.0001, -0.001],
+                "dof_vel_limits": [-0.001, -0.1],
+            }
+            warmup_steps = 10000
+            curr_steps = 10000
         
         soft_dof_pos_limit = 0.9
+        soft_dof_vel_limit = 0.9
         base_height_target = 0.38
         foot_clearance_target = 0.08 # desired foot clearance above ground [m]
         foot_height_offset = 0.022   # height of the foot coordinate origin above ground [m]
@@ -152,8 +174,11 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
             base_height = -1.0
             #torque_limits = -0.001
             torque_limits = -0.1
+            dof_vel_limits = -0.01
             dof_vel = -0.0001
             if terrain_name in ("baseline"):
+                torque_limits = -0.01
+                dof_close_to_default = -0.01
                 # limitation
                 dof_pos_limits = -2.0
                 collision = -1.0
@@ -270,8 +295,6 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
 
         randomize_base_mass = True
 
-        push_robots = True
-
         randomize_com_displacement = True
         com_pos_x_range = [-0.03, 0.03]
         com_pos_y_range = [-0.03, 0.03]
@@ -287,21 +310,23 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         randomize_ctrl_delay = True
         ctrl_delay_step_range = [0, 1]
         randomize_joint_armature = True
-        joint_armature_range = [0.015, 0.025]  # [N*m*s/rad]
+        joint_armature_range = [0.00, 0.015]  # [N*m*s/rad]
         randomize_joint_friction = True
-        joint_friction_range = [0.01, 0.02]
+        joint_friction_range = [0.00, 0.20]
         randomize_joint_damping = True
-        joint_damping_range = [0.25, 0.3]
+        joint_damping_range = [0.00, 0.80]
 
         if terrain_name in ("baseline"):
-            added_mass_range = [-1., 1.]
+            added_mass_range = [-1., 2.]
             push_interval_s = 10
             max_push_vel_xy = 1.
+            push_robots = True
         else:
             added_mass_range = [-1., 2.]
             push_interval_s = 3
             max_push_vel_xy = 0.5
-        
+            push_robots = False
+
         randomize_camera_pos = True
         camera_com_displacement_range = [0.01, 0.0025, 0.03]
         randomize_camera_euler = True
@@ -317,6 +342,10 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         add_depth = True
         use_warp = True
         class depth_camera_config(LeggedRobotDreamwaqCfg.sensor.depth_camera_config):
+            # New training follows Robot Parkour's Go2 synthetic depth model.
+            # Set to "legacy" when reproducing checkpoints trained before the
+            # alignment; this field is included in expanded saved configs.
+            depth_noise_profile = "parkour_aligned"
             decimation = 5
             resolution = [int(480/4), int(640/4)]
             num_history = 1
@@ -348,7 +377,8 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
             stereo_full_block_width_mean_std = [3, 0.01]
             stereo_half_block_spark_prob = 0.02
             stereo_half_block_value = 3000
-            sky_artifacts_prob = 0.001
+            sky_artifacts_prob = 0.0001
+            legacy_sky_artifacts_prob = 0.001
             sky_artifacts_far_distance = 2.
             sky_artifacts_values = [0.6, 1., 1.2, 1.5, 1.8]
             sky_artifacts_height_mean_std = [2, 3.2]
@@ -401,3 +431,6 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
                 max_iterations = 80000
             else:
                 max_iterations = 40000
+
+
+# uv pip install python-dotenv

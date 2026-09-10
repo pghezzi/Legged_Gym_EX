@@ -91,6 +91,7 @@ class DreamWaQDepthLoraRunner(OnPolicyRunner):
 
         tot_iter = self.current_learning_iteration + num_learning_iterations
         for it in range(self.current_learning_iteration, tot_iter):
+            self.env.step_reward_curriculum(it)
             start = time.time()
             # Rollout
             with torch.inference_mode():
@@ -100,7 +101,7 @@ class DreamWaQDepthLoraRunner(OnPolicyRunner):
                     obs, privileged_obs, obs_history, explicit_info_labels, next_state, rewards, dones, depth_image = obs.to(self.device), \
                         privileged_obs.to(self.device), obs_history.to(self.device), explicit_info_labels.to(self.device), next_state.to(self.device), rewards.to(self.device), dones.to(self.device) \
                             , depth_image.to(self.device)
-                    self.alg.process_env_step(rewards, dones, infos, next_state, depth_image)
+                    self.alg.process_env_step(rewards, dones, infos, next_state)
 
                     if self.log_dir is not None:
                         # Book keeping

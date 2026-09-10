@@ -718,6 +718,7 @@ class IsaacGymSimulator(Simulator):
         else:
             raise NameError(f"Unknown controller type: {control_type}")
         torques *= self._motor_strength_scale
+        self._unclipped_torques = torques.detach().clone()
         return torch.clip(torques, -self._torque_limits, self._torque_limits)
     
     def _init_domain_params(self):
@@ -1345,6 +1346,12 @@ class IsaacGymSimulator(Simulator):
     def torques(self):
         return self._torques[:, self._dof_indices]
     
+    @property
+    def unclipped_torques(self):
+        if not hasattr(self, "_unclipped_torques"):
+            return torch.zeros_like(self.torques)
+        return self._unclipped_torques[:, self._dof_indices]
+
     @property
     def torque_limits(self):
         return self._torque_limits[self._dof_indices]

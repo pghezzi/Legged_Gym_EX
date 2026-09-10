@@ -814,6 +814,7 @@ class IsaacLabSimulator(Simulator):
         
         # print(f"torques applied: {torques[0]}")
         # sequence of torque is the same of as the DOF order in the robot articulation
+        self._unclipped_torques = torques.detach().clone()
         self._robot.set_joint_effort_target(
                 torch.clip(torques, -self.torque_limits, self.torque_limits)
             )
@@ -1248,6 +1249,12 @@ class IsaacLabSimulator(Simulator):
         # convert from simulation order to specified order
         return self._robot.data.computed_torque[:, self._dof_indices]
     
+    @property
+    def unclipped_torques(self):
+        if not hasattr(self, "_unclipped_torques"):
+            return torch.zeros_like(self.torques)
+        return self._unclipped_torques[:, self._dof_indices]
+
     @property
     def torque_limits(self):
         """Returns the torque limits of the robot's joints.

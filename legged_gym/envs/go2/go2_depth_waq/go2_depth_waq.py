@@ -14,6 +14,34 @@ def torch_rand_float(lower, upper, shape, device):
 from .depth_mixin import DepthMixin
 
 class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
+
+    def _prepare_reward_function(self):
+        # Keep configured zero-start curriculum terms in the reward registry.
+        enabled = getattr(self.cfg.rewards, "use_reward_curriculum", False)
+        if enabled:
+            cfg = self.cfg.rewards.reward_curriculum
+            for key in cfg.curr_reward_keys:
+                if key in self.reward_scales and self.reward_scales[key] == 0:
+                    low, high = cfg.curr_reward_bounds[key]
+                    self.reward_scales[key] = high if high != 0 else low
+        super()._prepare_reward_function()
+        if enabled:
+            self.step_reward_curriculum(0)
+
+    def step_reward_curriculum(self, num_iters):
+        """PACT warmup/cosine schedule, indexed by PPO iteration."""
+        if not getattr(self.cfg.rewards, "use_reward_curriculum", False):
+            return
+        cfg = self.cfg.rewards.reward_curriculum
+        if cfg.curr_steps <= 0 or cfg.warmup_steps < 0:
+            raise ValueError("Reward curriculum requires curr_steps > 0 and warmup_steps >= 0")
+        alpha = np.clip((num_iters - cfg.warmup_steps) / cfg.curr_steps, 0.0, 1.0)
+        ramp = 0.5 * (1.0 - np.cos(np.pi * alpha))
+        for key in cfg.curr_reward_keys:
+            if key in self.reward_scales:
+                low, high = cfg.curr_reward_bounds[key]
+                value = low if alpha == 0 else high if alpha == 1 else low + (high - low) * ramp
+                self.reward_scales[key] = value * self.dt
     
     def compute_observations(self):
         self._update_depth_observations()
@@ -34,13 +62,13 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
                     self.simulator.dr_rand_push_vels[:, :2],      # 2
                     self.simulator.dr_kp_scale,                   # num_actions
                     self.simulator.dr_kd_scale,                    # num_actions
-                    self.simulator.dr_motor_strength_scale
+                    self.simulator.dr_motor_strength_scale,       # num_actions
             ), dim=-1)
         # Critic observation
         critic_obs = torch.cat((
             self.simulator.base_lin_vel * self.obs_scales.lin_vel,                   # 3
             self.obs_buf,                 # num_observations
-            domain_randomization_info,    # 34
+            domain_randomization_info,    # 43 (12-joint Go2)
         ), dim=-1)
         ## add link contact states
         if self.cfg.asset.obtain_link_contact_states:
