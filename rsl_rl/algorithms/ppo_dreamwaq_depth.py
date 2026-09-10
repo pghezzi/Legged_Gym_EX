@@ -189,6 +189,9 @@ class PPO_DreamWaQ_Depth(PPO):
         mean_explicit_estimation_loss = 0
         mean_reconstruction_loss = 0
         mean_kld_loss = 0
+        auxiliary = getattr(self, "parkour_auxiliary", None)
+        if auxiliary is not None:
+            auxiliary.last_loss = 0.
         generator = self._get_data_generator()
         initial_weight = self.actor_critic.vae.vel_mu.weight.detach().clone()
         for obs_batch, privileged_obs_batch, obs_histories_batch, explicit_info_labels_batch, next_state_batch, \
@@ -211,13 +214,24 @@ class PPO_DreamWaQ_Depth(PPO):
             for _ in range(self.num_encoder_epochs):
                 
                 vae_loss, explicit_estimation_loss, reconstruction_loss, kld_loss = self._compute_vae_loss(
-                    obs_histories_batch, terminated_batch, explicit_info_labels_batch, next_state_batch)
+                    obs_histories_batch, terminated_batch, explicit_info_labels_batch, next_state_batch,
+                    depth_image_batch)
                 
                 self.vae_optimizer.zero_grad()
+                if auxiliary is not None:
+                    # Clear PPO gradients: this backward updates encoders/heads only.
+                    self.optimizer.zero_grad(set_to_none=True)
+                    auxiliary.optimizer.zero_grad(set_to_none=True)
                 vae_loss.backward()
                 nn.utils.clip_grad_norm_(
                 self.vae_parameters, self.max_grad_norm)
                 self.vae_optimizer.step()
+                if auxiliary is not None and auxiliary.batch_active:
+                    nn.utils.clip_grad_norm_(
+                        list(self.actor_critic.visual_encoder.parameters()) + list(auxiliary.heads.parameters()),
+                        self.max_grad_norm)
+                    self.optimizer.step()  # existing visual-encoder Adam state
+                    auxiliary.optimizer.step()
                 
                 mean_explicit_estimation_loss += explicit_estimation_loss.item()
                 mean_reconstruction_loss += reconstruction_loss.item()
@@ -235,6 +249,9 @@ class PPO_DreamWaQ_Depth(PPO):
         mean_explicit_estimation_loss /= (num_updates * self.num_encoder_epochs)
         mean_reconstruction_loss /= (num_updates * self.num_encoder_epochs)
         mean_kld_loss /= (num_updates * self.num_encoder_epochs)
+        if auxiliary is not None:
+            auxiliary.last_loss /= (num_updates * self.num_encoder_epochs)
+            auxiliary.masks.zero_()
         self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss, mean_explicit_estimation_loss, \
@@ -268,7 +285,8 @@ class PPO_DreamWaQ_Depth(PPO):
         
         return loss, surrogate_loss, value_loss
     
-    def _compute_vae_loss(self, obs_histories_batch, terminated_batch, explicit_info_labels_batch, next_state_batch):
+    def _compute_vae_loss(self, obs_histories_batch, terminated_batch, explicit_info_labels_batch, next_state_batch,
+                          depth_image_batch=None):
         sampled_out, distribution_params = self.actor_critic.vae.forward(obs_histories_batch)
         z,v = sampled_out
         latent_mu, latent_var, _, _ = distribution_params
@@ -279,6 +297,10 @@ class PPO_DreamWaQ_Depth(PPO):
         # Ignore the explicit_estimation and reconstruction loss for terminated episodes
         reconstruction_loss = nn.functional.mse_loss(reconstructed_out * terminated_batch,
                                                              next_state_batch * terminated_batch)
+        auxiliary = getattr(self, "parkour_auxiliary", None)
+        if auxiliary is not None:
+            reconstruction_loss = reconstruction_loss + auxiliary.reconstruction_loss(
+                z, v, depth_image_batch, terminated_batch)
         # KL Divergence loss of VAE
         kld_loss = -0.5 * torch.mean(torch.sum(1 + latent_var - latent_mu ** 2 - latent_var.exp(), dim = 1) * terminated_batch)
         vae_loss = explicit_estimation_loss + reconstruction_loss + self.vae_kld_weight * kld_loss

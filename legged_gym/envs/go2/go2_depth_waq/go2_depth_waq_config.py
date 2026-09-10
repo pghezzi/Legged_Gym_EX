@@ -406,6 +406,15 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
         vae_kld_weight = 2.0
         num_mini_batches = 4
     class runner( LeggedRobotDreamwaqCfgPPO.runner ):
+        # Training-only heads, saved separately from the legacy actor-critic.
+        # Enable explicitly: PARKOUR_AUX=1 TERRAIN=gap ... python ...
+        parkour_auxiliary = {
+            "enabled": os.environ.get("PARKOUR_AUX", "0") == "1",
+            "hidden_dim": 64,
+            "loss_weight": 0.1,
+            "learning_rate": 2.e-4,
+            "max_distance": 3.0,
+        }
         policy_class_name = "ActorCriticDreamWaQDepth"
         algorithm_class_name = "PPO_DreamWaQ_Depth"
         run_name = 'dreamwaq'
@@ -434,3 +443,13 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
 
 
 # uv pip install python-dotenv
+
+
+# cd /workspace/LeggedGym-Ex
+
+# export PARKOUR_AUX=1
+# export SIMULATOR=isaacgym
+# export TERRAIN=gap
+# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_baseline/Sep09_05-49-24_dreamwaq_isaacgym/model_10000.pt
+
+# python -m legged_gym.scripts.train --task go2_depth_waq --headless

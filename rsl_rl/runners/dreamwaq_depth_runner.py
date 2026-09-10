@@ -52,6 +52,33 @@ class DreamWaQDepthRunner(OnPolicyRunner):
                  device='cpu'):
 
         super().__init__(env, train_cfg, log_dir, device)
+        self.parkour_auxiliary = None
+        aux_cfg = self.cfg.get("parkour_auxiliary", {})
+        if aux_cfg.get("enabled", False):
+            if env.num_camera_envs != env.num_envs:
+                raise ValueError("Parkour auxiliary training requires one depth camera per environment")
+            from rsl_rl.utils.parkour_auxiliary import ParkourAuxiliary
+            from legged_gym.utils.parkour_auxiliary_targets import IsaacGymParkourTargets
+            self.parkour_targets = IsaacGymParkourTargets(env, aux_cfg["max_distance"])
+            self.parkour_auxiliary = ParkourAuxiliary(self.alg, aux_cfg)
+            self.alg.parkour_auxiliary = self.parkour_auxiliary
+
+    def save(self, path, infos=None, cur_iter=None):
+        super().save(path, infos, cur_iter)
+        if self.parkour_auxiliary is not None:
+            directory = os.path.join(os.path.dirname(path), "auxiliary")
+            os.makedirs(directory, exist_ok=True)
+            self.parkour_auxiliary.save(os.path.join(directory, os.path.basename(path)))
+
+    def load(self, path, load_optimizer=True):
+        infos = super().load(path, load_optimizer)
+        if self.parkour_auxiliary is not None:
+            sidecar = os.path.join(os.path.dirname(path), "auxiliary", os.path.basename(path))
+            if os.path.isfile(sidecar):
+                self.parkour_auxiliary.load(sidecar, load_optimizer)
+            else:
+                print("No auxiliary sidecar: initializing new geometry decoders for this checkpoint.")
+        return infos
     
     def _init_agent_and_algo(self):
         actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCriticTS
@@ -96,12 +123,16 @@ class DreamWaQDepthRunner(OnPolicyRunner):
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
+                    if self.parkour_auxiliary is not None:
+                        self.parkour_auxiliary.capture(*self.parkour_targets())
                     actions = self.alg.act(obs, privileged_obs, obs_history, explicit_info_labels, depth_image)
                     obs, privileged_obs, obs_history, explicit_info_labels, next_state, rewards, dones, infos, depth_image = self.env.step(actions)
                     obs, privileged_obs, obs_history, explicit_info_labels, next_state, rewards, dones, depth_image = obs.to(self.device), \
                         privileged_obs.to(self.device), obs_history.to(self.device), explicit_info_labels.to(self.device), next_state.to(self.device), rewards.to(self.device), dones.to(self.device) \
                             , depth_image.to(self.device)
                     self.alg.process_env_step(rewards, dones, infos, next_state)
+                    if self.parkour_auxiliary is not None:
+                        self.parkour_auxiliary.ready.copy_(~dones.bool())
 
                     if self.log_dir is not None:
                         # Book keeping
@@ -162,6 +193,8 @@ class DreamWaQDepthRunner(OnPolicyRunner):
         self.writer.add_scalar('Loss/explicit_estimation', locs['mean_explicit_estimation_loss'], locs['it'])
         self.writer.add_scalar('Loss/reconstruction', locs['mean_reconstruction_loss'], locs['it'])
         self.writer.add_scalar('Loss/vae_kl_divergence', locs['mean_kld_loss'], locs['it'])
+        if self.parkour_auxiliary is not None:
+            self.writer.add_scalar('Loss/parkour_geometry', self.parkour_auxiliary.last_loss, locs['it'])
         self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
         self.writer.add_scalar("Loss/hybrid_encoder_learning_rate", self.alg.encoder_lr, locs['it'])
         self.writer.add_scalar('Policy/mean_noise_std', mean_std.item(), locs['it'])

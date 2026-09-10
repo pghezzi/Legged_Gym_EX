@@ -113,6 +113,8 @@ class RolloutStorageDreamWaQDepth(RolloutStorage):
                 start = i*mini_batch_size
                 end = (i+1)*mini_batch_size
                 batch_idx = indices[start:end]
+                # Optional training-only labels follow the exact same permutation.
+                self.current_batch_indices = batch_idx
 
                 obs_batch = observations[batch_idx]
                 privileged_obs_batch = privileged_observations[batch_idx]
