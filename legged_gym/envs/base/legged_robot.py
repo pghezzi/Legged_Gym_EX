@@ -290,6 +290,8 @@ class LeggedRobot(BaseTask):
         if self.cfg.terrain.curriculum:
             self.extras["episode"]["terrain_level"] = torch.mean(
                 self.simulator.terrain_levels.float())
+            self.extras["episode"]["terrain_level_max"] = torch.max(
+                self.simulator.terrain_levels.float())
         if self.cfg.commands.curriculum:
             self.extras["episode"]["max_command_x"] = self.command_ranges["lin_vel_x"][1]
         # send timeout info to the algorithm
@@ -778,7 +780,7 @@ class LeggedRobot(BaseTask):
 
     def _reward_torque_limits(self) -> Reward:
         # Penalize applied torque above the soft limit (after command clipping).
-        return torch.sum((torch.abs(self.simulator.unclipped_torques) - self.simulator.torque_limits*self.cfg.rewards.soft_torque_limit).clip(min=0.), dim=1)
+        return torch.sum((torch.abs(self.simulator.torques) - self.simulator.torque_limits*self.cfg.rewards.soft_torque_limit).clip(min=0.), dim=1)
 
     def _reward_tracking_lin_vel(self) -> Reward:
         # Tracking of linear velocity commands (xy axes)

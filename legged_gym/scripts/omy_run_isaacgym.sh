@@ -1,10 +1,17 @@
 #!/bin/sh
 set -eu
 
-cd /home/oyoungquist/Research/Genesis_Development/Legged_Gym_EX
+# Resolve the repository relative to this script, on any host machine.
+script_repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+cd "$script_repo"
+
+training_gpu=${TRAIN_GPU:-0}
+case "$training_gpu" in
+  ''|*[!0-9]*) echo "TRAIN_GPU must be a host GPU index, such as 0 or 1." >&2; exit 1 ;;
+esac
 
 docker run --rm -it \
-  --gpus '"device=1"' \
+  --gpus "device=$training_gpu" \
   --ipc=host \
   --network=host \
   -e NVIDIA_DRIVER_CAPABILITIES=all \

@@ -27,6 +27,25 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
         super()._prepare_reward_function()
         if enabled:
             self.step_reward_curriculum(0)
+        self.obstacle_progress = None
+        progress_cfg = getattr(self.cfg.rewards, "obstacle_progress", None)
+        if progress_cfg is not None and progress_cfg.enabled:
+            from legged_gym.utils.obstacle_progress import ObstacleProgress
+            self.obstacle_progress = ObstacleProgress(self, progress_cfg)
+
+    def compute_reward(self):
+        super().compute_reward()
+        if self.obstacle_progress is not None:
+            # This runs before reset_idx. Include simultaneous failure + timeout.
+            failed = (self.gap_reset_buf |
+                      (self.fail_buf > self.cfg.env.fail_to_terminal_time_s / self.dt) |
+                      (self.terminated_bodies_force_norm > 10.).any(dim=1) |
+                      (self.simulator.projected_gravity[:, 2] > self.cfg.env.max_projected_gravity))
+            progress, completion = self.obstacle_progress.advance(failed)
+            # Displacement and one-shot events are NOT reward rates (no dt).
+            self.rew_buf += progress + completion
+            # Stationary penalty is a reward/second rate, already time-integrated.
+            self.rew_buf += self.obstacle_progress.state.stationary_penalty
 
     def step_reward_curriculum(self, num_iters):
         """PACT warmup/cosine schedule, indexed by PPO iteration."""
@@ -323,6 +342,8 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
                 self.command_ranges["lin_vel_x"][1] + 0.5, 0., self.cfg.commands.max_curriculum)
     
     def _pre_sim_step(self, actions):
+        if self.obstacle_progress is not None:
+            self.obstacle_progress.begin()
         super()._pre_depth_step()
         return super()._pre_sim_step(actions)
 
@@ -341,7 +362,14 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
         return obs, privileged_obs, obs_history, explicit_labels, next_state, depth_sensor_output
 
     def reset_idx(self, env_ids):
+        progress = getattr(self, "obstacle_progress", None)
+        metrics = ({"obstacle/" + name: value[env_ids].mean()
+                    for name, value in progress.state.totals.items()}
+                   if progress is not None and len(env_ids) else {})
         super().reset_idx(env_ids)
+        if metrics:
+            self.extras["episode"].update(metrics)
+            progress.state.reset(env_ids)
         super()._reset_depth_buffers(env_ids)
         self.gap_fall_counter[env_ids] = 0
         

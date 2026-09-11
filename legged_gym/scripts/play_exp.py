@@ -12,7 +12,6 @@ from legged_gym.utils.exp_data_logger import ExpLogger
 from legged_gym.utils.terrain_vars import TERRAIN_INDEX
 import argparse
 
-import cv2
 
 SWAP = 1
 
@@ -532,10 +531,6 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             if policy1 is not None:
                 print(f"Models diff: {torch.sum(torch.abs(actions - policy1(obs_buf, obs_history, depth)))}")
             obs_buf, privileged_obs_buf, obs_history, explicit_labels, next_states, rews, dones, infos, depth = env.step(actions.detach())
-            if not args.no_depth_cam:
-                cv2.imshow("Depth", ((env.depth_sensor_output[0].squeeze())*255).to(torch.uint8).cpu().numpy())
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
             if args.save_depth_classifier_data:
                 depth_images_log.append(env.depth_sensor_output.detach().cpu().clone())
                 base_rpy_log.append(env.simulator._base_euler.detach().cpu().clone())
@@ -613,9 +608,6 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
                 'feet_pos':env.simulator.feet_pos.detach().cpu().numpy().tolist(),
                 'failure':list(map(int, env.get_failure_idx().detach().cpu().numpy().tolist())),
             })
-    if "depth_waq" in task_name and not args.no_depth_cam:
-        cv2.destroyAllWindows()
-
     if args.save_depth_classifier_data:
         depth_images_tensor = torch.stack(depth_images_log, dim=0).squeeze(2)   # [T, num_envs, 1, H, W] (or however depth is shaped)
         base_rpy_tensor = torch.stack(base_rpy_log, dim=0)       # [T, num_envs, 4]
