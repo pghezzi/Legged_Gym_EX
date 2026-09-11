@@ -143,6 +143,26 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                           30.1, 30.1, 15.7, 
                           30.1, 30.1, 15.7]
     class rewards( Go2RoughCommonCfg.rewards ):
+        class obstacle_progress:
+            # Opt-in, dedicated IsaacGym simplified GAP/PIT/STAIRS only.
+            enabled = True
+            # [k_progress (reward/metre), b0 (reward), b1 (reward/unit difficulty)]
+            gap = [1.00, 0.40, 0.667]
+            pit = [1.00, 0.40, 0.667]
+            stairs = [1.00, 0.40, 0.667]
+            activation_distance = 1.0  # m before first edge/riser
+            base_clearance = 0.35  # m beyond final edge for base/root
+            foot_clearance = 0.05  # m beyond final edge for ALL feet
+            support_duration_s = 0.10  # continuous destination support
+            min_support_feet = 2
+            contact_force_threshold = 10.0  # N, vertical force per foot
+            foot_height_offset = 0.022  # m, foot link origin above surface
+            support_height_tolerance = 0.06  # m
+            stationary_speed = 0.05  # m/s, stationary threshold
+            stationary_radius = 1.0  # m from crossing path (penalty), final edge (time log)
+            stationary_penalty_rate = 0.05  # reward/s deducted; 0 disables penalty
+            stationary_grace_s = 0.50  # continuous stationary time before charging
+
         use_reward_curriculum = False
 
         class reward_curriculum:
@@ -171,7 +191,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         base_up_pit_sigma = 0.01
         tracking_sigma = 0.2
         corner_proximity_sigma = 0.01
-        only_positive_rewards = True
+        only_positive_rewards = False
         feet_edge_threshold = 0.05 # distance threshold below which foot is considered to be near the edge of a terrain
         class scales:
             base_height = -1.0
@@ -202,26 +222,26 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                 dof_close_to_default_stand_still = -0.5
             elif terrain_name in ("gap", "stairs", "all_stairs"):
                 dof_pos_limits = -2.0
-                collision = -10.0
-                tracking_lin_vel = 1.5
+                collision = -2.0
+                tracking_lin_vel = 3.0
                 tracking_ang_vel = 1.0
-                lin_vel_z = -1.0
+                lin_vel_z = -0.1
                 ang_vel_xy = -0.05
-                orientation = -1.0
+                orientation = -0.1
                 dof_power = -2e-05
                 dof_acc = -2e-07
                 action_rate = -0.01
                 action_smoothness = -0.01
                 hip_pos = -0.15
-                foot_clearance_terrain_aware = 0.7
+                foot_clearance = 0.7
                 feet_stumble = -1.0
                 #feet_contact_stand_still = 0.1
                 feet_near_edge = -1.0
                 feet_air_time = 0.6
             elif terrain_name in ("pit", "center_platform", "all_pit"):
                 dof_pos_limits = -2.0
-                collision = -10.0
-                tracking_lin_vel = 1.2
+                collision = -2.0
+                tracking_lin_vel = 3.0
                 tracking_ang_vel =  0.7
                 lin_vel_z = -0.1
                 ang_vel_xy = -0.05
@@ -231,7 +251,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                 action_rate = -0.001
                 action_smoothness = -0.001
                 hip_pos = -0.015
-                foot_clearance_terrain_aware = 0.7
+                foot_clearance = 0.7
                 feet_stumble = -1.0
                 #feet_contact_stand_still = 0.1
                 feet_near_edge = -1.0
@@ -457,12 +477,20 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
 
 # python -m legged_gym.scripts.train --task go2_depth_waq --headless
 
-
-# NEW Resume logic!
 # export DEPTHWAQ_RESUME_UNTIL=50000
 # export TERRAIN=gap
 # export PARKOUR_AUX=1
-# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep10_03-44-19_dreamwaq_isaacgym/model_16500.pt
+# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep11_00-49-09_dreamwaq_isaacgym/model_16000.pt
+
+# python -m legged_gym.scripts.train --task go2_depth_waq --headless
+
+
+
+# NEW Resume logic!
+# export DEPTHWAQ_RESUME_UNTIL=65000
+# export TERRAIN=pit
+# export PARKOUR_AUX=1
+# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_pit/Sep11_01-24-38_dreamwaq_isaacgym/model_18000.pt
 
 # python -m legged_gym.scripts.train --task go2_depth_waq --headless
 
