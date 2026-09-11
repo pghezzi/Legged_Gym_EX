@@ -440,7 +440,7 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
             #elif terrain_name in ("stairs", "gap"):
             #    max_iterations = 30000
             elif terrain_name in ("pit"):
-                max_iterations = 80000
+                max_iterations = 65000
             else:
                 max_iterations = 40000
 
@@ -452,7 +452,7 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
 
 # export PARKOUR_AUX=1
 # export SIMULATOR=isaacgym
-# export TERRAIN=gap
+# export TERRAIN=pit
 # export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_baseline/Sep09_05-49-24_dreamwaq_isaacgym/model_10000.pt
 
 # python -m legged_gym.scripts.train --task go2_depth_waq --headless
