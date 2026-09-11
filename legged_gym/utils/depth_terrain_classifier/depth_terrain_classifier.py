@@ -360,6 +360,13 @@ class SobelDepthTerrainFeatureExtractor:
         depth = self._as_depth_batch(depth_images)
         depth, valid = self._crop_fill_resize(depth)
         b, h, w = depth.shape
+        # The DepthWaQ exporter traces a fixed image shape. Older PyTorch
+        # tracers expose these shape entries as scalar tensors, whereas this
+        # feature extractor intentionally uses them in static Python layout
+        # calculations (regions, crops, and pooling windows).
+        b = int(b.item()) if torch.is_tensor(b) else int(b)
+        h = int(h.item()) if torch.is_tensor(h) else int(h)
+        w = int(w.item()) if torch.is_tensor(w) else int(w)
         rpy = self._as_imu_batch(orientation_rpy, b, 3, "orientation_rpy")
         omega = self._as_imu_batch(angular_velocity, b, 3, "angular_velocity")
 
@@ -627,10 +634,21 @@ class SobelDepthTerrainFeatureExtractor:
 
     def _crop_fill_resize(self, depth: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         _, h, w = depth.shape
-        top = min(h - 1, max(0, int(round(self.crop[0] * h))))
-        bottom = min(h, max(top + 1, int(round(self.crop[1] * h))))
-        left = min(w - 1, max(0, int(round(self.crop[2] * w))))
-        right = min(w, max(left + 1, int(round(self.crop[3] * w))))
+        # During tracing on older PyTorch versions, symbolic shape entries may
+        # arrive here as scalar tensors. Cropping is fixed configuration, so
+        # materialize the traced input dimensions as Python integers.
+        h = int(h.item()) if torch.is_tensor(h) else int(h)
+        w = int(w.item()) if torch.is_tensor(w) else int(w)
+        # ``crop`` is static configuration. It is normally a tuple of floats,
+        # but TorchScript tracing can materialize saved scalar configuration as
+        # zero-dimensional tensors. Convert it back before applying Python's
+        # integer crop arithmetic.
+        crop = tuple(float(value.item()) if torch.is_tensor(value) else float(value)
+                     for value in self.crop)
+        top = min(h - 1, max(0, int(round(crop[0] * h))))
+        bottom = min(h, max(top + 1, int(round(crop[1] * h))))
+        left = min(w - 1, max(0, int(round(crop[2] * w))))
+        right = min(w, max(left + 1, int(round(crop[3] * w))))
         depth = depth[:, top:bottom, left:right]
 
         valid = torch.isfinite(depth) & (depth > self.min_depth) & (depth < self.max_depth)
@@ -667,10 +685,12 @@ class SobelDepthTerrainFeatureExtractor:
         # image. This removes the dominant perspective slope while retaining localized
         # steps, ledges, roughness, gaps, and overhead obstacles.
         row_mean = depth.mean(dim=2)
-        edge_rows = max(1, depth.shape[1] // 8)
+        height = depth.shape[1]
+        height = int(height.item()) if torch.is_tensor(height) else int(height)
+        edge_rows = max(1, height // 8)
         top = row_mean[:, :edge_rows].mean(dim=1)
         bottom = row_mean[:, -edge_rows:].mean(dim=1)
-        t = torch.linspace(0.0, 1.0, depth.shape[1], device=depth.device, dtype=depth.dtype)
+        t = torch.linspace(0.0, 1.0, height, device=depth.device, dtype=depth.dtype)
         profile = top[:, None] + (bottom - top)[:, None] * t[None, :]
         return profile[:, :, None].expand_as(depth)
 
