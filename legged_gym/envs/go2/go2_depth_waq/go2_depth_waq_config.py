@@ -143,7 +143,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                           30.1, 30.1, 15.7, 
                           30.1, 30.1, 15.7]
     class rewards( Go2RoughCommonCfg.rewards ):
-        use_reward_curriculum = True
+        use_reward_curriculum = False
 
         class reward_curriculum:
             # PACT schedule plus joint-velocity penalties; absent terms are skipped.
@@ -176,8 +176,8 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         class scales:
             base_height = -1.0
             #torque_limits = -0.001
-            torque_limits = -0.01
-            dof_vel_limits = -0.01
+            torque_limits = -0.1
+            dof_vel_limits = -0.001
             dof_vel = -0.0001
             if terrain_name in ("baseline"):
                 torque_limits = -0.01
@@ -414,7 +414,7 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
         parkour_auxiliary = {
             "enabled": os.environ.get("PARKOUR_AUX", "0") == "1",
             "hidden_dim": 64,
-            "loss_weight": 0.1,
+            "loss_weight": 0.01,
             "learning_rate": 2.e-4,
             "max_distance": 3.0,
         }
@@ -465,3 +465,17 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
 # export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep10_03-44-19_dreamwaq_isaacgym/model_16500.pt
 
 # python -m legged_gym.scripts.train --task go2_depth_waq --headless
+
+
+# export TERRAIN=gap
+# export PARKOUR_AUX=0
+# unset DEPTHWAQ_RESUME_UNTIL FINETUNE
+
+# python -m legged_gym.scripts.play_exp \
+#   --task go2_depth_waq \
+#   --load_run /workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep10_18-42-26_dreamwaq_isaacgym \
+#   --ckpt -1 \
+#   --num_envs 1 \
+#   --curriculum \
+#   --test_terrain gap \
+#   --follow_robot
