@@ -628,6 +628,8 @@ def override_configs_multiterrain(env_cfg, args):
     env_cfg.commands.curriculum = False
     if hasattr(env_cfg.commands, "custom_command_curriculum"):
         env_cfg.commands.custom_command_curriculum = False
+    if hasattr(env_cfg.rewards, "obstacle_progress"):
+        env_cfg.rewards.obstacle_progress.enabled = False
     env_cfg.commands.heading_command = False
     env_cfg.commands.zero_cmd_prob = 0.0
     env_cfg.commands.resampling_time = 1.0e9

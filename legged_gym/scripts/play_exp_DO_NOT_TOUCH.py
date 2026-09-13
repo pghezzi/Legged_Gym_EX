@@ -342,7 +342,8 @@ def override_configs(env_cfg, args):
     # number of environments
     env_cfg.env.num_envs = envs
     env_cfg.asset.terminate_after_contacts_on = []
-    env_cfg.rewards.obstacle_progress.enabled = False
+    if hasattr(env_cfg.rewards, "obstacle_progress"):
+        env_cfg.rewards.obstacle_progress.enabled = False
     if args.explore:
         env_cfg.init_state.yaw_random_scale = np.pi
         env_cfg.commands.ranges.heading = [-3.14, 3.14]
