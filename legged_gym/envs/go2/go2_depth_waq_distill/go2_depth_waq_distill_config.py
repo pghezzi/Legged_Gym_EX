@@ -110,6 +110,7 @@ class Go2DepthWaqDistillCfg(Go2DepthWaqCfg):
         # Define them explicitly because the parent config selects its scales
         # at import time from TERRAIN, whose default is random_uniform.
         class scales:
+            feet_prolonged_air_time = Go2DepthWaqCfg.rewards.scales.feet_prolonged_air_time
             base_height = -1.0
             torque_limits = -0.001
             dof_pos_limits = -2.0

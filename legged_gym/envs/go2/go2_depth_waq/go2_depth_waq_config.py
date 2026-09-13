@@ -145,9 +145,6 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
     class rewards( Go2RoughCommonCfg.rewards ):
         feet_air_time_target = 0.25  # s; shorter swings retain the existing penalty
         feet_air_time_max = 0.50  # s; longer swings earn no touchdown reward
-        # Reward/s per overdue foot, deducted AFTER positive reward clipping.
-        # Independent of command speed, obstacle progress, and feet_air_time scale.
-        feet_prolonged_air_time_penalty_rate = 0.2  # 0 disables only the penalty
 
         class obstacle_progress:
             # Opt-in, dedicated IsaacGym simplified GAP/PIT/STAIRS only.
@@ -193,6 +190,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         foot_clearance_target = 0.08 # desired foot clearance above ground [m]
         foot_height_offset = 0.022   # height of the foot coordinate origin above ground [m]
         foot_clearance_tracking_sigma = 0.01
+        foot_clearance_min_swing_speed = 0.05  # m/s XY; terrain-aware reward needs a moving swing foot
         soft_torque_limit = 0.9
         base_up_pit_sigma = 0.01
         tracking_sigma = 0.2
@@ -200,6 +198,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         only_positive_rewards = True
         feet_edge_threshold = 0.05 # distance threshold below which foot is considered to be near the edge of a terrain
         class scales:
+            feet_prolonged_air_time = -0.2  # reward/s per overdue foot, before clipping; 0 disables
             base_height = -1.0
             #torque_limits = -0.001
             torque_limits = -0.1
@@ -517,16 +516,16 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
 # python -m legged_gym.scripts.train --task go2_depth_waq --headless
 
 
-# export TERRAIN=gap
+# export TERRAIN=pit
 # export PARKOUR_AUX=0
 # export FINETUNE=1
 # unset DEPTHWAQ_RESUME_UNTIL
 
 # python -m legged_gym.scripts.play_exp \
 #   --task go2_depth_waq \
-#   --load_run /workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep11_22-11-26_dreamwaq_isaacgym \
-#   --ckpt 39000 \
+#   --load_run /workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_pit/Sep11_22-12-25_dreamwaq_isaacgym \
+#   --ckpt 50000 \
 #   --num_envs 1 \
 #   --curriculum \
-#   --test_terrain gap \
+#   --test_terrain pit \
 #   --follow_robot
