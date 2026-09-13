@@ -36,10 +36,10 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         class termination():
             reset_unrecoverable_gaps = True
             gap_terrain_depth_threshold = 1.0
-            gap_foot_drop_threshold = 0.25
-            gap_base_drop_threshold = 0.30
+            gap_foot_drop_threshold = 0.10
+            gap_base_drop_threshold = 0.20
             gap_min_fallen_feet = 1
-            gap_reset_steps = 4
+            gap_reset_steps = 2
     #else:
     #    class termination():
     #        reset_unrecoverable_gaps = False
@@ -104,6 +104,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         }
         terrain_curriculum_difficulty.update(terrain_curriculum_difficulty_custom)
         terrain_proportions = terrain_list
+        max_init_terrain_level = 5 # starting curriculum level
         #terrain_proportions = [0] * 11
         #terrain_proportions[10] = 1
         
@@ -235,10 +236,10 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                 orientation = -1.0
                 dof_power = -2e-05
                 dof_acc = -2e-07
-                action_rate = -0.01
+                action_rate = -0.001
                 action_smoothness = -0.001
                 hip_pos = -0.15
-                foot_clearance = 0.3
+                foot_clearance_terrain_aware = 0.7
                 feet_stumble = -1.0
                 #feet_contact_stand_still = 0.1
                 feet_near_edge = -1.0
@@ -500,7 +501,7 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
 # export DEPTHWAQ_RESUME_UNTIL=50000
 # export TERRAIN=gap
 # export PARKOUR_AUX=0
-# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep11_00-49-09_dreamwaq_isaacgym/model_17000.pt
+# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep11_22-11-26_dreamwaq_isaacgym/model_40000.pt
 
 # python -m legged_gym.scripts.train --task go2_depth_waq --headless
 
