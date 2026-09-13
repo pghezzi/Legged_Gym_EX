@@ -16,6 +16,13 @@ from .depth_mixin import DepthMixin
 class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
 
     def _prepare_reward_function(self):
+        rewards = self.cfg.rewards
+        if not 0 <= rewards.feet_air_time_target < rewards.feet_air_time_max:
+            raise ValueError("Require 0 <= feet_air_time_target < feet_air_time_max")
+        if not np.isfinite(rewards.feet_air_time_max) or not (
+                np.isfinite(rewards.feet_prolonged_air_time_penalty_rate)
+                and rewards.feet_prolonged_air_time_penalty_rate >= 0):
+            raise ValueError("Airtime limit and nonnegative penalty rate must be finite")
         # Keep configured zero-start curriculum terms in the reward registry.
         enabled = getattr(self.cfg.rewards, "use_reward_curriculum", False)
         if enabled:
@@ -25,6 +32,8 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
                     low, high = cfg.curr_reward_bounds[key]
                     self.reward_scales[key] = high if high != 0 else low
         super()._prepare_reward_function()
+        # Applied separately after positive clipping, but logged with other terms.
+        self.episode_sums["feet_prolonged_air_time"] = torch.zeros_like(self.rew_buf)
         if enabled:
             self.step_reward_curriculum(0)
         self.obstacle_progress = None
@@ -34,7 +43,12 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
             self.obstacle_progress = ObstacleProgress(self, progress_cfg)
 
     def compute_reward(self):
+        self._update_feet_air_time()
         super().compute_reward()
+        penalty = (self._reward_feet_prolonged_air_time()
+                   * self.cfg.rewards.feet_prolonged_air_time_penalty_rate * self.dt)
+        self.rew_buf -= penalty
+        self.episode_sums["feet_prolonged_air_time"] -= penalty
         if self.obstacle_progress is not None:
             # This runs before reset_idx. Include simultaneous failure + timeout.
             failed = (self.gap_reset_buf |
@@ -252,6 +266,7 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
 
     def _init_buffers(self):
         super()._init_buffers()
+        self.feet_touchdown_air_time = torch.zeros_like(self.feet_air_time)
         #self.force_fail_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         #self.termination_counter_threshold = getattr(self.cfg.asset, "termination_count", 1)
         self.gap_fall_counter = torch.zeros(
@@ -367,6 +382,8 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
                     for name, value in progress.state.totals.items()}
                    if progress is not None and len(env_ids) else {})
         super().reset_idx(env_ids)
+        self.last_contacts[env_ids] = False
+        self.feet_touchdown_air_time[env_ids] = 0.
         if metrics:
             self.extras["episode"].update(metrics)
             progress.state.reset(env_ids)
@@ -441,17 +458,30 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
         # thus to encourage the robot to walk across the terrain in the commanded direction
         return torch.exp(-lin_vel_error/self.cfg.rewards.tracking_sigma) * heading_coef
     
-    def _reward_feet_air_time(self):
-        # Reward long steps
-        contact = self.simulator.link_contact_forces[:, self.simulator.feet_indices, 2] > 1.
+    def _update_feet_air_time(self):
+        # Updated once per control step, even if the touchdown reward is disabled.
+        # check_termination has already reduced contact history for each backend.
+        contact = self.feet_max_force_z > 1.
         contact_filt = torch.logical_or(contact, self.last_contacts)
-        self.last_contacts = contact
-        first_contact = (self.feet_air_time > 0.) * contact_filt
-        self.feet_air_time += self.dt
-        rew_airTime = torch.sum((self.feet_air_time - 0.25) * first_contact, dim=1)  # reward only on first contact with the ground
-        rew_airTime *= torch.norm(self.commands[:, :2], dim=1) > 0.1  # no reward for zero command
-        self.feet_air_time *= ~contact_filt
-        return rew_airTime
+        self.last_contacts.copy_(contact)
+        self.feet_touchdown_air_time.copy_(torch.where(
+            contact_filt, self.feet_air_time, torch.zeros_like(self.feet_air_time)))
+        self.feet_air_time.copy_(torch.where(
+            contact_filt, torch.zeros_like(self.feet_air_time), self.feet_air_time + self.dt))
+
+    def _reward_feet_air_time(self):
+        # Pay only for completed swings within the allowed duration. A prolonged
+        # hold forfeits its entire touchdown bonus, rather than banking reward.
+        duration = self.feet_touchdown_air_time
+        valid = (duration > 0.) & (duration <= self.cfg.rewards.feet_air_time_max + 1e-6)
+        reward = ((duration - self.cfg.rewards.feet_air_time_target) * valid).sum(dim=1)
+        return reward * (torch.norm(self.commands[:, :2], dim=1) > 0.1)
+
+    def _reward_feet_prolonged_air_time(self):
+        # Per-foot penalty also applies at zero command. Charge only the portion
+        # of this control step past the limit; do not count the grace period.
+        overdue = (self.feet_air_time - self.cfg.rewards.feet_air_time_max).clamp(0., self.dt)
+        return overdue.sum(dim=1) / self.dt
     
     def _reward_foot_clearance(self):
         """
@@ -540,6 +570,18 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
             self.simulator.default_dof_pos[:, hip_joint_indices]), dim=-1)
         return dof_pos_error
     
+    def _reward_front_hip_pos(self):
+        """Squared deviation of FR/FL hips from their default positions."""
+        indices = [0, 3]
+        return torch.square(self.simulator.dof_pos[:, indices] -
+                            self.simulator.default_dof_pos[:, indices]).sum(dim=-1)
+
+    def _reward_rear_hip_pos(self):
+        """Squared deviation of RR/RL hips from their default positions."""
+        indices = [6, 9]
+        return torch.square(self.simulator.dof_pos[:, indices] -
+                            self.simulator.default_dof_pos[:, indices]).sum(dim=-1)
+
     def _reward_feet_near_edge(self):
         """ Penalize feet being too close to the edge of a terrain
         """

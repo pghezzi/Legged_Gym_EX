@@ -355,7 +355,7 @@ def override_configs(env_cfg, args):
             env_cfg.viewer.pos[i] = env_cfg.viewer.pos[i] - env_cfg.terrain.plane_length / 4
             env_cfg.viewer.lookat[i] = env_cfg.viewer.lookat[i] - env_cfg.terrain.plane_length / 4    
         
-    env_cfg.terrain.max_init_terrain_level = env_cfg.terrain.num_rows - 1
+    env_cfg.terrain.max_init_terrain_level = 9
     if args.use_joystick:
         env_cfg.commands.heading_command = False
     
@@ -477,26 +477,32 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         iter_count = 4.0
 
     for i in range(int(iter_count*env.max_episode_length)):
-        if args.command_test_suite:
-            current = i // env.max_episode_length
-            if i % env.max_episode_length == 0:
-                name = test_names[current]
-                cmd = command_tests[name]
-                print(f"Running test {name}, {cmd}")
-            env.commands[:, 0] = cmd["vx"]
-            env.commands[:, 1] = cmd["vy"]
-            env.commands[:, 2] = cmd["wz"]
-            env.commands[:, 3] = cmd["heading"]
-        elif args.use_joystick:
-            joystick.update()
-            env.commands[:, 0] = -joystick.ly
-            env.commands[:, 1] = -joystick.lx
-            env.commands[:, 2] = -joystick.rx
-        elif i % env.max_episode_length == 0:
-            env._resample_commands(torch.arange(env.num_envs))
+        # if args.command_test_suite:
+        #     current = i // env.max_episode_length
+        #     if i % env.max_episode_length == 0:
+        #         name = test_names[current]
+        #         cmd = command_tests[name]
+        #         print(f"Running test {name}, {cmd}")
+        #     env.commands[:, 0] = cmd["vx"]
+        #     env.commands[:, 1] = cmd["vy"]
+        #     env.commands[:, 2] = cmd["wz"]
+        #     env.commands[:, 3] = cmd["heading"]
+        # elif args.use_joystick:
+        #     joystick.update()
+        #     env.commands[:, 0] = -joystick.ly
+        #     env.commands[:, 1] = -joystick.lx
+        #     env.commands[:, 2] = -joystick.rx
+        # elif i % env.max_episode_length == 0:
+        #     env._resample_commands(torch.arange(env.num_envs))
 
-        if args.save_depth_classifier_data:
-            pass
+        # if args.save_depth_classifier_data:
+        #     pass
+
+        cmd = command_tests["forward"]
+        env.commands[:, 0] = cmd["vx"]
+        env.commands[:, 1] = cmd["vy"]
+        env.commands[:, 2] = cmd["wz"]
+        env.commands[:, 3] = cmd["heading"]
 
         
         if args.jit and i == env.max_episode_length:
