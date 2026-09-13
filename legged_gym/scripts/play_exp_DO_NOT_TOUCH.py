@@ -342,6 +342,7 @@ def override_configs(env_cfg, args):
     # number of environments
     env_cfg.env.num_envs = envs
     env_cfg.asset.terminate_after_contacts_on = []
+    env_cfg.rewards.obstacle_progress.enabled = False
     if args.explore:
         env_cfg.init_state.yaw_random_scale = np.pi
         env_cfg.commands.ranges.heading = [-3.14, 3.14]
@@ -435,7 +436,7 @@ def override_configs(env_cfg, args):
             env_cfg.terrain.border_size = 0.0
             env_cfg.env.episode_length_s = 120
             env_cfg.terrain.num_rows = 10
-            env_cfg.terrain.num_cols = 4
+            env_cfg.terrain.num_cols = 10
             env_cfg.terrain.platform_size = 3.0
             env_cfg.terrain.curriculum = False
             env_cfg.terrain.selected   = False
@@ -695,6 +696,32 @@ def print_debug_info(env, robot_index):
     # print(f"ankle pitch: {env.simulator.dof_pos[robot_index, [3,7]].cpu().numpy()}")
     pass
 
+
+def randomize_terrain_on_reset(env):
+    """Randomize terrain patch assignment before each reset in this play script.
+
+    The environment's regular ``reset_idx`` then places each robot at the new
+    origin.  This deliberately lives here, rather than in ``LeggedRobot``, so
+    training and every other play entry point retain their existing behavior.
+    """
+    original_reset_idx = env.reset_idx
+
+    def reset_idx_with_random_terrain(env_ids):
+        simulator = env.simulator
+        if env_ids.numel() and simulator.custom_origins:
+            terrain_origins = simulator._terrain_origins
+            levels, terrain_types = terrain_origins.shape[:2]
+            simulator._terrain_levels[env_ids] = torch.randint(
+                levels, (env_ids.numel(),), device=env_ids.device)
+            simulator._terrain_types[env_ids] = torch.randint(
+                terrain_types, (env_ids.numel(),), device=env_ids.device)
+            simulator._env_origins[env_ids] = terrain_origins[
+                simulator._terrain_levels[env_ids], simulator._terrain_types[env_ids]]
+        return original_reset_idx(env_ids)
+
+    env.reset_idx = reset_idx_with_random_terrain
+
+
 def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
     """Run interaction loop between environment and policy
 
@@ -709,6 +736,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
     stop_state_log = 300 # number of steps before plotting states
     stop_rew_log = env.max_episode_length + 1 # number of steps before print average episode rewards
 
+    randomize_terrain_on_reset(env)
     env.reset()
 
     # logger = ExpLogger(train_cfg.runner.exp_data_path)
@@ -905,17 +933,18 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         #    k = 0.5
         #    desired_heading = k*torch.atan2(dy, dx)
         #    env.commands[:, 3] = desired_heading
-        if args.jit:
-            import time
-            with lock:
-                if requested_mode is not None:
-                    if requested_mode < policy.num_of_loras:
-                        policy.swap(requested_mode)
-                        start = time.perf_counter()
-                        policy_tester.swap(requested_mode)
-                        end = time.perf_counter()
-                        print(f"Time: {end - start} seconds")
-                        requested_mode = None
+        
+        #if args.jit:
+        #    
+        #    with lock:
+        #        if requested_mode is not None:
+        #            if requested_mode < policy.num_of_loras:
+        #                policy.swap(requested_mode)
+        #                start = time.perf_counter()
+        #                policy_tester.swap(requested_mode)
+        #                end = time.perf_counter()
+        #                print(f"Time: {end - start} seconds")
+        #                requested_mode = None
 
 
         #if arg.test_terrain not in ("plane", "baseline") and args.save_depth_classifier_data:
@@ -1557,7 +1586,7 @@ def play(args):
     policy1 = None
     
     if args.jit:
-        policy1 = policy
+        #policy1 = policy
         policy = torch.jit.load(args.jit,  map_location=args.gpu if not args.cpu else 'cpu')
         if hasattr(policy, 'swap'):
             policy = multi_jit(policy, TERRAIN_KEYS)
