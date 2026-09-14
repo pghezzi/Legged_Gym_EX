@@ -30,6 +30,7 @@ Modes: offline | locomotion | all | plot-only | cost-only
   --locomotion-arg TOKEN    Repeat once per additional locomotion argument/value.
                             Path/mode overrides are reserved by this wrapper.
   --dry-run                Validate inputs and print commands; create no outputs.
+  --progress-interval SEC  Launcher heartbeat interval (default 30; 0 disables).
   --smoke-test success|failure
                             Exercise Docker writes/cleanup only; no experiments,
                             Python, simulator, or dependency installation.
@@ -54,6 +55,7 @@ gpu=${TRAIN_GPU:-0}
 output_root=${PAPER_OUTPUT_ROOT:-$repo/paper_runs}
 run_id= classifier_data= ordered_data= offline_dir= jit= distilled= bundle= smoke=
 dry_run=false
+progress_interval=30
 offline_extra=() locomotion_extra=()
 collection_cost=() compilation_cost=() distillation_runs=() relocation_sources=() relocation_hosts=()
 deployment_targets=() deployment_files=()
@@ -66,7 +68,7 @@ while (($#)); do
             if [[ $1 == --path-map ]]; then relocation_sources+=("$2"); relocation_hosts+=("$3")
             else deployment_targets+=("$2"); deployment_files+=("$3"); fi
             shift 3; continue;;
-        --image|--gpu|--classifier-data|--ordered-data|--paper-offline-dir|--jit|--distilled-jit|--bundle|--output-root|--run-id|--offline-arg|--locomotion-arg|--smoke-test|--collection-cost|--compilation-cost|--distillation-run)
+        --image|--gpu|--classifier-data|--ordered-data|--paper-offline-dir|--jit|--distilled-jit|--bundle|--output-root|--run-id|--offline-arg|--locomotion-arg|--smoke-test|--collection-cost|--compilation-cost|--distillation-run|--progress-interval)
             (($# >= 2)) && [[ -n $2 ]] || die "Missing value for $1";;
         *) die "Unknown option: $1";;
     esac
@@ -77,12 +79,14 @@ while (($#)); do
         --output-root) output_root=$2;; --run-id) run_id=$2;;
         --offline-arg) offline_extra+=("$2");; --locomotion-arg) locomotion_extra+=("$2");;
         --smoke-test) smoke=$2;;
+        --progress-interval) progress_interval=$2;;
         --collection-cost) collection_cost+=("$2");; --compilation-cost) compilation_cost+=("$2");;
         --distillation-run) distillation_runs+=("$2");;
     esac
     shift 2
 done
 [[ -z $smoke || $smoke == success || $smoke == failure ]] || die 'Invalid smoke-test outcome'
+[[ $progress_interval =~ ^(0|[1-9][0-9]*)$ ]] || die 'progress-interval must be a nonnegative integer'
 [[ $gpu =~ ^[0-9]+$ || ($gpu == none && ($mode == plot-only || $mode == cost-only || -n $smoke)) ]] || die 'Invalid host GPU index'
 [[ -z $run_id || $run_id =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die 'run-id must be a single safe directory name'
 
@@ -289,9 +293,19 @@ umask 000
 mkdir -p -- "$output_root"
 mkdir -- "$run_dir" # Atomic exclusive creation; never reuse or chmod old results.
 mkdir -- "$run_dir/offline" "$run_dir/locomotion" "$run_dir/costs" "$run_dir/logs"
+heartbeat_pid=
+stop_heartbeat() {
+    if [[ -n $heartbeat_pid ]]; then
+        kill "$heartbeat_pid" 2>/dev/null || true
+        wait "$heartbeat_pid" 2>/dev/null || true
+        heartbeat_pid=
+    fi
+}
+progress() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$run_dir/logs/progress.log"; }
 finish_host() {
     local status=$? permissions=0
     trap - EXIT
+    stop_heartbeat
     printf '%s\n' "$status" > "$run_dir/exit_status"
     # Host handles console logs; a no-GPU container can repair root-owned files
     # after a killed runner. Only this new run is mounted, never sources/inputs.
@@ -316,16 +330,36 @@ printf '%s\n' "mode=$mode" "image=$image" "host_gpu=$gpu" "run_id=$run_id" "smok
     "commit=$(git -C "$repo" rev-parse HEAD)" "started_utc=$(date -u +%FT%TZ)" > "$run_dir/run_metadata.txt"
 git -C "$repo" status --short > "$run_dir/git_status.txt"
 printf '%s\n' "${mappings[@]}" > "$run_dir/mounts.txt"
+progress "Outputs: $run_dir; heartbeat every ${progress_interval}s (waiting is not proof of computation progress)."
 run_stage() {
     local stage=$1
     shift
     local command=("${docker_base[@]}" -c "$container_script" paper "$stage" "$smoke" "$@")
     print_command "${command[@]}" >> "$run_dir/commands.sh"
+    local started=$SECONDS
+    progress "START $stage — console log: $run_dir/logs/$stage.log"
+    if ((progress_interval)); then
+        (
+            sleeper=
+            trap 'if [[ -n $sleeper ]]; then kill "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; fi; exit 0' TERM INT
+            while true; do
+                sleep "$progress_interval" & sleeper=$!
+                wait "$sleeper" || exit 0
+                sleeper=
+                now=$(date +%s)
+                modified=$(stat -c %Y "$run_dir/logs/$stage.log" 2>/dev/null || printf '%s' "$now")
+                progress "WAITING $stage | elapsed $((SECONDS-started))s | last console output $((now-modified))s ago | check stage log for actual progress"
+            done
+        ) &
+        heartbeat_pid=$!
+    fi
     set +e
     "${command[@]}" 2>&1 | tee "$run_dir/logs/$stage.log"
     local codes=("${PIPESTATUS[@]}")
     set -e
+    stop_heartbeat
     printf '%s\n' "${codes[0]}" > "$run_dir/logs/$stage.exit_status"
+    progress "END $stage | elapsed $((SECONDS-started))s | process exit=${codes[0]}, log exit=${codes[1]}"
     ((codes[0] == 0)) || return "${codes[0]}"
     return "${codes[1]}"
 }

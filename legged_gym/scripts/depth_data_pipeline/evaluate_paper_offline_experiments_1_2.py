@@ -257,6 +257,7 @@ def _write_figure_bundle(output, structural_test, ordered_test, ordered_ids, ext
                          runs, e1_rows, e2_rows, e1_summary, e2_summary, classes, settings):
     from .paper_figure_bundle import (PLOT_CONFIG, geometric_examples, provenance,
                                      sample_transitions, transition_thumbnails, save_bundle, plot_bundle)
+    print("[paper] Preparing sampled depth annotations and transition thumbnails", flush=True)
     examples, unavailable = geometric_examples(extractor, structural_test, classes,
         PLOT_CONFIG["images_per_class"], PLOT_CONFIG["sampling_seed"])
     ordered_meta = provenance(ordered_test, _labels(ordered_ids))
@@ -287,6 +288,7 @@ def _write_figure_bundle(output, structural_test, ordered_test, ordered_ids, ext
                   filter_settings={"ema": dict(FIXED_EMA_CONFIG), "bayes": dict(FIXED_BAYES_CONFIG)},
                   model_settings=settings, plot_config=dict(PLOT_CONFIG),
                   skill_semantics="Offline emitted terrain label requests its corresponding skill; no locomotion policy is executed")
+    print("[paper] Saving and validating figure_data.pt (including round-trip/checksum)", flush=True)
     info = save_bundle(bundle, output / "figure_data.pt")
     info.update(plot_bundle(bundle, output))
     save_results(output / "figure_manifest.json", info)
@@ -366,6 +368,8 @@ def _bundle_from_existing(args):
 
 def _make_plots(output: Path, experiment_1: Sequence[Mapping[str, Any]],
                 experiment_2: Sequence[Mapping[str, Any]], class_ids: Sequence[Any]) -> None:
+    output = output / "figures" / "results"
+    output.mkdir(parents=True, exist_ok=True)
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -468,6 +472,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
+    print("[paper] Offline runner started", flush=True)
     if args.plot_only:
         from .paper_figure_bundle import load_bundle, plot_bundle
         bundle = load_bundle(args.plot_only)
@@ -495,6 +500,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
 
+    print(f"[paper] Loading training/validation data from {structural_dir}", flush=True)
     loading_timer = WallTimer(device).start()
     train = torch.load(structural_dir / "train.pt", map_location="cpu", weights_only=False)
     validation = torch.load(structural_dir / "val.pt", map_location="cpu", weights_only=False)
@@ -508,6 +514,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     ordered_dir = _resolve_data_folder(
         args.ordered_data, dataset_root, ("bayesian", "bayes", "sequences"),
         ("test",), "ordered")
+    print(f"[paper] Loading structural test and ordered test ({ordered_dir})", flush=True)
     structural_test = torch.load(structural_dir / "test.pt", map_location="cpu", weights_only=False)
     ordered_test = torch.load(ordered_dir / "test.pt", map_location="cpu", weights_only=False)
     for name, data in (("structural test", structural_test),
@@ -515,6 +522,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         unknown = set(_labels(data["labels"])) - set(class_ids)
         if unknown:
             raise ValueError(f"{name} contains labels absent from training: {sorted(unknown, key=str)}")
+    print("[paper] Validating split provenance and preparing ordered sequences", flush=True)
     provenance_checks = validate_partitions(
         {"train": train, "validation": validation, "structural_test": structural_test},
         args.allow_legacy_provenance)
@@ -524,6 +532,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.allow_legacy_provenance)
     ordered_ids = sequence_ids_for(ordered_test, allow_legacy=args.allow_legacy_provenance)
 
+    print("[paper] Preparing calibration, engineered features, and standardization", flush=True)
     reset_peak_memory(device)
     feature_total_timer = WallTimer(device).start()
     preprocessing_timer = WallTimer(device).start()
@@ -550,6 +559,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     for architecture in ("feature_nn", "raw_depth_nn"):
         config = FIXED_MODEL_CONFIGS[architecture]
         if architecture == "raw_depth_nn":
+            print("[paper] Packing raw-depth/proprioceptive training inputs", flush=True)
             # Match the existing raw-depth trainer while avoiding a second copy
             # of these large packed inputs during all feature-NN runs.
             reset_peak_memory(device)
@@ -564,6 +574,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             raw_total_s = raw_total_timer.stop()
             raw_preprocessing_peak_mb = peak_memory_mb(device)
         for seed in MODEL_SEEDS:
+            print(f"[paper] Training {architecture}, seed {seed} ({MODEL_SEEDS.index(seed)+1}/{len(MODEL_SEEDS)} for this architecture), max {MAX_EPOCHS} epochs", flush=True)
             seed_total_timer = WallTimer(device).start()
             model_setup_timer = WallTimer(device).start()
             _set_seed(seed)
@@ -693,6 +704,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             write_cost_record(seed_dir / "training_cost.json", cost_record)
             training_records.append(cost_record)
 
+            print(f"[paper] {architecture} seed {seed}: training saved; running structural and ordered inference", flush=True)
             if architecture == "feature_nn":
                 structural_logits, structural_runtime = collect_engineered_logits(
                     classifier, extractor, standardizer, structural_test,
@@ -717,6 +729,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "confusion_matrix": json_safe(instant["confusion_matrix"]),
             })
             trace = {}
+            print(f"[paper] {architecture} seed {seed}: evaluating instantaneous / EMA / Bayes", flush=True)
             sequential_metrics = _sequential_metrics(
                 classifier, ordered_logits, ordered_test["labels"], ordered_ids, trace_sink=trace)
             figure_runs.append({"architecture": architecture, "seed": seed, "trace": trace,

@@ -110,9 +110,10 @@ def test_plot_only_no_checkpoints_or_datasets(tmp_path, monkeypatch):
     output = tmp_path / "plots"
     paper.main(["--plot-only", str(path), "--output", str(output), "--dataset", "/missing/dataset"])
     assert len(scales) == 32 and set(scales) == {(0, 1)}
-    assert len(list(output.glob("timeline_*.png"))) == 18
-    assert len(list(output.glob("confusion_*.png"))) == 16
-    assert len(list(output.glob("*.pdf"))) == len(list(output.glob("*.png")))
+    assert len(list(output.glob("figures/depth_and_trajectories/timeline_*.png"))) == 18
+    assert len(list(output.glob("figures/results/confusion_*.png"))) == 16
+    assert len(list(output.rglob("*.pdf"))) == len(list(output.rglob("*.png")))
+    assert not list(output.glob("*.png"))
     manifest = json.loads((output / "figure_manifest.json").read_text())
     assert manifest["bundle"] == str(path.resolve())
     assert all(Path(filename).is_file() for filename in manifest["outputs"])
@@ -168,7 +169,7 @@ def test_transition_coverage_disagreement_sampling_and_thumbnails():
         assert thumbnail["provenance"]["frame_indices"] == thumbnail["row_indices"]
 
 
-def test_sampled_timeline_png_pdf_with_thumbnails(tmp_path):
+def test_sampled_timeline_png_pdf_with_thumbnails(tmp_path, capsys):
     bundle, _ = sample_bundle()
     data = {"labels": bundle["ordered_truth"], "sequence_ids": bundle["ordered_provenance"]["sequence_ids"],
             "source_ids": bundle["ordered_provenance"]["source_ids"], "frame_indices": torch.arange(12),
@@ -182,10 +183,13 @@ def test_sampled_timeline_png_pdf_with_thumbnails(tmp_path):
     figures.save_bundle(bundle, path)
     restored = figures.load_bundle(path)
     report = figures.plot_bundle(restored, tmp_path / "plots")
-    assert (tmp_path / "plots/transition_depth_sample_000.png").is_file()
-    assert (tmp_path / "plots/transition_depth_sample_000.pdf").is_file()
-    assert len(list((tmp_path / "plots").glob("timeline_sample_000_*.png"))) == 18
+    assert (tmp_path / "plots/figures/depth_and_trajectories/transition_depth_sample_000.png").is_file()
+    assert (tmp_path / "plots/figures/depth_and_trajectories/transition_depth_sample_000.pdf").is_file()
+    assert len(list((tmp_path / "plots").glob("figures/depth_and_trajectories/timeline_sample_000_*.png"))) == 18
     assert Path(report["browse_index"]).is_file()
+    output = capsys.readouterr().out
+    count = len(list((tmp_path / "plots").rglob("*.png")))
+    assert f"{count}/{count} complete" in output
 
 
 def test_existing_checkpoint_mode_never_fits_or_writes_costs(tmp_path, monkeypatch):

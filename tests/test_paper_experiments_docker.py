@@ -107,6 +107,24 @@ class PaperDockerLauncherTests(unittest.TestCase):
         self.assertEqual((run / "exit_status").read_text().strip(), "7")
         self.assertEqual(len((run / "commands.sh").read_text().splitlines()), 3)
 
+    def test_heartbeat_during_silent_stage_and_failure_cleanup(self):
+        fake_bin = self.root / "silent-bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text("#!/usr/bin/env bash\nsleep 2\nexit 23\n")
+        docker.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]}):
+            result = self.launch("cost-only", "--paper-offline-dir", self.offline, "--progress-interval", "1")
+        self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+        self.assertIn("START costs", result.stdout)
+        self.assertIn("WAITING costs", result.stdout)
+        self.assertIn("last console output", result.stdout)
+        self.assertIn("END costs", result.stdout)
+        progress = (self.root / "outputs/test-run/logs/progress.log").read_text()
+        self.assertTrue(progress.rstrip().endswith("process exit=23, log exit=0"))
+        self.assertNotEqual(self.launch("cost-only", "--paper-offline-dir", self.offline,
+                                       "--progress-interval", "-1", "--dry-run").returncode, 0)
+
     @unittest.skipUnless(os.environ.get("RUN_DOCKER_COSTS") == "1" and shutil.which("docker"), "opt-in real cost aggregation")
     def test_real_cost_only_without_experiments(self):
         training = []

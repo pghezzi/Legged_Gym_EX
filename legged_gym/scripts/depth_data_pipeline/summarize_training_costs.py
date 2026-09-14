@@ -723,6 +723,8 @@ def _plots(
     summary: Sequence[Mapping[str, Any]],
     locomotion: Path | None,
 ) -> list[str]:
+    output = output / "figures" / "results"
+    output.mkdir(parents=True, exist_ok=True)
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt

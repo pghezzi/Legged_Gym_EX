@@ -2,7 +2,7 @@
 from pathlib import Path
 import hashlib
 import json
-import html
+from .paper_figure_paths import figure_path, write_figure_index
 
 import numpy as np
 import torch
@@ -209,6 +209,8 @@ def geometric_examples(extractor, data, classes, count_per_class=100, seed=42):
                          "near_row": near, "center_columns": [(w-cw)//2, (w-cw)//2+cw],
                          "feature_names": list(extractor.FEATURE_NAMES)})
         counts[label] += 1
+        if counts[label] == 1 or counts[label] % 25 == 0:
+            print(f"[paper figures] Depth examples: {label} {counts[label]}/{count_per_class}", flush=True)
     for label, count in counts.items():
         if count < count_per_class:
             unavailable.append(f"Only {count}/{count_per_class} distinct valid depth examples available for {label}")
@@ -321,12 +323,21 @@ def plot_bundle(bundle, output):
     validate_bundle(bundle)
     classes, config = bundle["class_ordering"], bundle["plot_config"]
     files, unavailable = [], list(bundle["unavailable"])
+    selections_for_count = bundle.get("timeline_selections", [bundle["timeline_selection"]] if bundle["timeline_selection"] else [])
+    total_figures = (4*(len(bundle["model_seeds"])+1) + len(bundle["examples"]) + 1
+                     + len(selections_for_count)*len(bundle["runs"])*len(METHODS)
+                     + len(bundle.get("transition_thumbnails", [])))
+    print(f"[paper figures] Rendering {total_figures} figures, each as PNG + PDF, into {output}", flush=True)
     def save(fig, name):
         for suffix in ("png", "pdf"):
-            path = output / (name + "." + suffix)
+            path = figure_path(output, name + "." + suffix)
+            path.parent.mkdir(parents=True, exist_ok=True)
             fig.savefig(path, dpi=config["dpi"], bbox_inches="tight")
             files.append(str(path.resolve()))
         plt.close(fig)
+        completed = len(files)//2
+        if completed == 1 or completed % 25 == 0 or completed == total_figures:
+            print(f"[paper figures] {completed}/{total_figures} complete: {name}", flush=True)
     for method in ("structural", *METHODS):
         source = bundle["experiment_1_rows"] if method == "structural" else [r for r in bundle["experiment_2_rows"] if r["temporal_method"] == method]
         for seed in (*bundle["model_seeds"], "aggregate"):
@@ -430,21 +441,13 @@ def plot_bundle(bundle, output):
                         ax.axvline(boundary-selected["boundaries"][0], color="gray", linestyle=":")
                 fig.suptitle(f"{prefix}{run['architecture']} seed {run['seed']} / {method}")
                 save(fig, f"timeline_{prefix}{run['architecture']}_seed_{run['seed']}_{method}")
-    files.extend(str(path.resolve()) for path in sorted(output.glob("experiment_*.png")))
-    files.extend(str(path.resolve()) for path in sorted(output.glob("experiment_*.pdf")))
-    cards = []
-    for filename in files:
-        path = Path(filename)
-        if path.suffix == ".png":
-            name, pdf = html.escape(path.name), html.escape(path.with_suffix(".pdf").name)
-            cards.append(f'<figure><a href="{name}"><img loading="lazy" width="360" src="{name}"></a>'
-                         f'<figcaption>{name} · <a href="{pdf}">PDF</a></figcaption></figure>')
-    (output / "figure_index.html").write_text('<!doctype html><meta charset="utf-8"><title>Paper figures</title>'
-        '<h1>Paper figures</h1><p>Click a thumbnail for the full PNG, or use its PDF link.</p>' + ''.join(cards))
+    files.extend(str(path.resolve()) for path in sorted(output.glob("figures/results/experiment_*.png")))
+    files.extend(str(path.resolve()) for path in sorted(output.glob("figures/results/experiment_*.pdf")))
+    write_figure_index(output, files)
     report = {"outputs": files, "unavailable": unavailable, "timeline_selection": bundle["timeline_selection"],
               "browse_index": str((output / "figure_index.html").resolve()),
               "timeline_selections": selections, "sampling_metadata": bundle.get("sampling_metadata"),
-              "depth_examples": [{"figure_stem": f"depth_geometry_{i}", "label": e["label"],
+              "depth_examples": [{"figure_stem": str(figure_path(Path(), f"depth_geometry_{i}")), "label": e["label"],
                                   "row_index": e["row_index"], "provenance": e["provenance"]} for i, e in enumerate(bundle["examples"])],
               "checks": bundle["checks"] if "checks" in bundle else validate_bundle(bundle)}
     (output / "figure_manifest.json").write_text(json.dumps(report, indent=2, default=str))

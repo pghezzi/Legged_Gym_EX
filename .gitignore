@@ -22,6 +22,9 @@ dist/
 # ignore pytorch checkpoint files
 *.pt
 
+**depth_waq_selector/*
+**paper_runs/*
+
 # Maven
 target/
 dist/

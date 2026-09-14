@@ -187,6 +187,15 @@ Path/mode overrides must use the wrapper's options; no shell command strings
 are evaluated. Without passthrough, existing experimental defaults are unchanged.
 Host GPU indices are exposed as `cuda:0` inside the single-GPU container.
 
+The launcher prints stage start/end and a heartbeat every 30 seconds showing
+elapsed time and time since the last console output. Set `--progress-interval 10`
+for more frequent updates, or `0` to disable heartbeats. These messages are saved
+in `logs/progress.log`; actual experiment messages remain in `logs/offline.log`
+(or the relevant stage log). A heartbeat means the launcher is still waiting,
+not proof that computation is advancing. Offline phase/model/seed messages and
+figure counts provide actual progress; figures report every 25 PNG/PDF pairs.
+An already-running Python process will not pick up these changes automatically.
+
 All checkpoints, metrics, figures/bundle and replay data persist under
 `<output-root>/<run-id>/offline/` and `locomotion/`. Console/simulator logs live
 in `logs/`; `commands.sh`, `mounts.txt`, `run_metadata.txt`, `git_status.txt`, and

@@ -41,7 +41,27 @@ and `timeline_sample_<sample>_<architecture>_seed_<seed>_<selector>` for every
 sample and combination. `transition_depth_sample_<sample>` contains a separate
 thumbnail contact sheet; the same thumbnails appear below each timeline.
 The existing bar/scatter figures are retained and now also exported as PDF.
-All PNG/PDF files are saved normally beside the bundle, not only inside it.
+All PNG/PDF files are saved outside the bundle, under these subfolders:
+
+```text
+offline/
+  figures/results/                 # bars, confusion matrices, metric scatters
+  figures/depth_and_trajectories/   # annotated depth, contact sheets, timelines
+  figure_index.html                # gallery linking both categories
+  figure_data.pt
+```
+
+Cost plots likewise use `costs/figures/results/`. CSV/JSON files and checkpoints
+keep their existing locations. Plot-only regeneration uses this layout too.
+To organize an older completed output without inference or replotting:
+
+```bash
+python legged_gym/scripts/depth_data_pipeline/paper_figure_paths.py \
+  paper_runs/<run-id>/offline paper_runs/<run-id>/costs
+```
+
+This moves root PNG/PDF files without overwriting, repairs manifest/gallery
+links, and backs up changed manifests/galleries as `*.before_figure_layout.bak`.
 Open `figure_index.html` to browse a thumbnail gallery with full PNG/PDF links.
 `manifest.json` links the bundle/checksum/figure paths; `figure_manifest.json`
 records plots, checks, and unavailable inputs/examples.
