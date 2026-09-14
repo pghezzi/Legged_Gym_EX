@@ -205,7 +205,8 @@ def _instantaneous_metrics(classifier: NeuralClassifierAdapter, logits: torch.Te
 
 
 def _sequential_metrics(classifier: NeuralClassifierAdapter, logits: torch.Tensor,
-                        labels: Sequence[Any], sequence_ids: Sequence[Any]) -> dict[str, dict[str, Any]]:
+                        labels: Sequence[Any], sequence_ids: Sequence[Any],
+                        trace_sink: dict | None = None) -> dict[str, dict[str, Any]]:
     scores = torch.as_tensor(logits).squeeze(0).cpu()
     probabilities = F.softmax(scores / FIXED_BAYES_CONFIG["T_filter"], dim=1)
     truth = _labels(labels)
@@ -225,14 +226,142 @@ def _sequential_metrics(classifier: NeuralClassifierAdapter, logits: torch.Tenso
         min_evidence_power=1.0, confidence_gamma=1.0,
         stay_probability=FIXED_BAYES_CONFIG["stable_stay"],
         transition_source="persistent", device="cpu")
-    bayes, _, _ = run_filter_sequences(
-        bayes_filter, probabilities, sequence_ids=ids, return_traces=False)
+    bayes, beliefs, powers = run_filter_sequences(
+        bayes_filter, probabilities, sequence_ids=ids, return_traces=trace_sink is not None)
+
+    if trace_sink is not None:
+        # Reuse the deployed EMA update; verify tracing reproduces the runner.
+        ema_scores, replay = [], []
+        for i, score in enumerate(scores):
+            if i == 0 or ids[i] != ids[i-1]:
+                ema_filter.reset()
+            replay.append(ema_filter.update(score))
+            ema_scores.append(ema_filter.ema_scores.detach().cpu().clone())
+        if replay != ema:
+            raise AssertionError("EMA trace differs from evaluated predictions")
+        smoothed = torch.stack(ema_scores)
+        trace_sink.update(logits=scores.clone(), probabilities=scores.softmax(-1),
+                          ema_scores=smoothed, ema_probabilities=smoothed.softmax(-1),
+                          bayes_beliefs=beliefs, bayes_evidence_powers=powers)
+        for name, values in (("instantaneous", instantaneous), ("ema", ema), ("bayes", bayes)):
+            trace_sink[name + "_selected"] = torch.tensor([classifier.class_ids.index(v) for v in values])
 
     return {
         name: evaluate_sequential_predictions(truth, predictions, classifier.class_ids, ids,
                                               transition_accounting_v2=True)
         for name, predictions in (("instantaneous", instantaneous), ("ema", ema), ("bayes", bayes))
     }
+
+
+def _write_figure_bundle(output, structural_test, ordered_test, ordered_ids, extractor,
+                         runs, e1_rows, e2_rows, e1_summary, e2_summary, classes, settings):
+    from .paper_figure_bundle import (PLOT_CONFIG, geometric_examples, provenance,
+                                     sample_transitions, transition_thumbnails, save_bundle, plot_bundle)
+    examples, unavailable = geometric_examples(extractor, structural_test, classes,
+        PLOT_CONFIG["images_per_class"], PLOT_CONFIG["sampling_seed"])
+    ordered_meta = provenance(ordered_test, _labels(ordered_ids))
+    selections, transition_sampling = sample_transitions(ordered_test, ordered_meta["sequence_ids"], runs,
+        PLOT_CONFIG["transition_samples"], PLOT_CONFIG["sampling_seed"], PLOT_CONFIG["timeline_padding"],
+        PLOT_CONFIG["disagreement_fraction"])
+    timeline = selections[0] if selections else None
+    if len(selections) < PLOT_CONFIG["transition_samples"]:
+        unavailable.append(f"Only {len(selections)}/{PLOT_CONFIG['transition_samples']} distinct GT transitions available")
+    thumbnails = transition_thumbnails(ordered_test, selections, PLOT_CONFIG["thumbnail_count"])
+    if ordered_meta["unavailable"]:
+        unavailable.append("Ordered provenance unavailable: " + ", ".join(ordered_meta["unavailable"]))
+    bundle = dict(schema_version=1, class_ordering=list(classes), model_seeds=list(MODEL_SEEDS),
+                  runs=runs, structural_truth=_labels(structural_test["labels"]), ordered_truth=_labels(ordered_test["labels"]),
+                  structural_provenance=provenance(structural_test), ordered_provenance=ordered_meta,
+                  experiment_1_rows=e1_rows, experiment_2_rows=e2_rows,
+                  experiment_1_summary=e1_summary, experiment_2_summary=e2_summary,
+                  examples=examples, timeline_selection=timeline, timeline_selections=selections,
+                  transition_thumbnails=thumbnails, unavailable=unavailable,
+                  sampling_metadata={"seed": PLOT_CONFIG["sampling_seed"], "images_per_class": PLOT_CONFIG["images_per_class"],
+                    "example_dataset": "structural_test", "transitions": transition_sampling,
+                    "thumbnail_rule": "Boundary frames, preceding frames, endpoints, focal frame, then evenly-spaced context; 48x64 bilinear thumbnails"},
+                  example_selection_rule="Seeded random source/env round-robin with sequence/time strata; up to 100 distinct valid structural-test images per GT class; retry invalid inputs",
+                  timeline_selection_rule="Up to 100 unique focal GT transitions: 50% disagreement-enriched quota and remaining unrestricted coverage; include adjacent GT boundary where available; no episode crossing",
+                  aggregation_rules={"confusion": "sum seed counts then normalize each GT row; absent class=N/A",
+                                     "uncertainty": "sample standard deviation across seeds, not standard error; scatter uses finite paired observations",
+                                     "legacy_figures": "unchanged equal-weight seed mean/std"},
+                  filter_settings={"ema": dict(FIXED_EMA_CONFIG), "bayes": dict(FIXED_BAYES_CONFIG)},
+                  model_settings=settings, plot_config=dict(PLOT_CONFIG),
+                  skill_semantics="Offline emitted terrain label requests its corresponding skill; no locomotion policy is executed")
+    info = save_bundle(bundle, output / "figure_data.pt")
+    info.update(plot_bundle(bundle, output))
+    save_results(output / "figure_manifest.json", info)
+    print("Figure inputs saved to", info["bundle"])
+    for reason in info["unavailable"]:
+        print("Figure input unavailable:", reason)
+    return info
+
+
+def _bundle_from_existing(args):
+    """Reporting-only entry point; never enters the training/cost-accounting path."""
+    from legged_gym.utils.depth_terrain_classifier.depth_terrain_classifier import SobelDepthTerrainFeatureExtractor
+    from legged_gym.utils.depth_terrain_classifier.terrain_classifier_bayes_streaming_prototype_rbf import FeatureStandardizer
+    source = args.bundle_from_existing.expanduser().resolve()
+    manifest = json.loads((source / "manifest.json").read_text())
+    if manifest["fixed_ema_configuration"] != FIXED_EMA_CONFIG or manifest["fixed_bayes_configuration"] != FIXED_BAYES_CONFIG:
+        raise ValueError("Existing run's frozen filter settings differ from this evaluator")
+    output = args.output.expanduser().resolve()
+    if output == source:
+        raise ValueError("Use a separate --output directory to preserve existing offline results/cost records")
+    output.mkdir(parents=True, exist_ok=True)
+    structural_dir = (args.classifier_data or Path(manifest["structural_dataset"])).expanduser().resolve()
+    ordered_dir = (args.ordered_data or Path(manifest["ordered_dataset"])).expanduser().resolve()
+    load = lambda path: torch.load(path, map_location="cpu", weights_only=False)
+    structural, ordered = load(structural_dir / "test.pt"), load(ordered_dir / "test.pt")
+    train, val = load(structural_dir / "train.pt"), load(structural_dir / "val.pt")
+    checks = validate_partitions({"train": train, "val": val, "test": structural}, args.allow_legacy_provenance)
+    ordered_checks = validate_partitions({"train": train, "val": val, "test": ordered}, args.allow_legacy_provenance)
+    del train, val
+    ids = sequence_ids_for(ordered, allow_legacy=args.allow_legacy_provenance)
+    classes = manifest["class_ordering"]
+    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else ("cpu" if args.device == "auto" else args.device)
+    feature_dir = source / "artifacts" / "feature_nn"
+    extractor = SobelDepthTerrainFeatureExtractor.load(feature_dir / "extractor.pt")
+    standardizer = FeatureStandardizer.load(feature_dir / "standardizer.pt")
+    e1, e2, runs = [], [], []
+    for architecture, constructor in (("feature_nn", TerrainDepthFeatureClassifierNN), ("raw_depth_nn", TerrainDepthClassifierNN)):
+        for seed in MODEL_SEEDS:
+            seed_dir = source / "artifacts" / architecture / f"seed_{seed}"
+            model_args = dict(load(seed_dir / "nn_model_args.pt"))
+            model_args.pop("cls", None)
+            model = constructor(**model_args)
+            classifier = NeuralClassifierAdapter.load(seed_dir / "classifier.pt", model, device=device)
+            classifier.require_feature = architecture == "feature_nn"
+            if list(classifier.class_ids) != list(classes):
+                raise ValueError("Checkpoint class ordering differs from offline manifest")
+            if architecture == "feature_nn":
+                collect = lambda data: collect_engineered_logits(classifier, extractor, standardizer, data,
+                    chunk_size=args.batch_size, mc_samples=1, mc_dropout=False)
+            else:
+                collect = lambda data: collect_raw_depth_logits(classifier, data, chunk_size=args.batch_size, mc_samples=1, mc_dropout=False)
+            structural_logits, runtime = collect(structural)
+            ordered_logits, _ = collect(ordered)
+            instant = _instantaneous_metrics(classifier, structural_logits, structural["labels"], runtime)
+            common = {"architecture": architecture, "seed": seed, "model_path": str(seed_dir / "classifier.pt")}
+            e1.append({**common, **{key: instant[key] for key in SCALAR_EXPERIMENT_1_METRICS},
+                       "per_class_recall": instant["per_class_recall"], "confusion_matrix": json_safe(instant["confusion_matrix"])})
+            trace = {}
+            metrics = _sequential_metrics(classifier, ordered_logits, ordered["labels"], ids, trace_sink=trace)
+            for method, values in metrics.items():
+                e2.append({**common, "temporal_method": method,
+                           **{key: values[key] for key in SCALAR_EXPERIMENT_2_METRICS + TRANSITION_V2_METRICS},
+                           "per_class_recall": values["per_class_recall"], "confusion_matrix": json_safe(values["confusion_matrix"])})
+            runs.append({**common, "model_args": model.get_args(), "trace": trace,
+                         "structural_logits": structural_logits.squeeze(0).cpu(),
+                         "structural_probabilities": structural_logits.squeeze(0).cpu().softmax(-1)})
+            classifier.to("cpu")
+    s1 = _aggregate(e1, ("architecture",), SCALAR_EXPERIMENT_1_METRICS, classes)
+    s2 = _aggregate(e2, ("architecture", "temporal_method"), SCALAR_EXPERIMENT_2_METRICS + TRANSITION_V2_METRICS, classes)
+    _make_plots(output, s1, s2, classes)
+    info = _write_figure_bundle(output, structural, ordered, ids, extractor, runs, e1, e2, s1, s2, classes,
+        {"source_manifest": manifest, "extractor": load(feature_dir / "extractor.pt"),
+         "standardizer": load(feature_dir / "standardizer.pt")})
+    save_results(output / "manifest.json", {"source_offline_dir": str(source), "training_performed": False,
+        "provenance_checks": checks, "ordered_provenance_checks": ordered_checks, "figures": info})
 
 
 def _make_plots(output: Path, experiment_1: Sequence[Mapping[str, Any]],
@@ -254,7 +383,8 @@ def _make_plots(output: Path, experiment_1: Sequence[Mapping[str, Any]],
                capsize=4, color=[colors[name] for name in architectures])
         ax.set_ylabel(ylabel)
         ax.grid(axis="y", alpha=0.25)
-        fig.tight_layout(); fig.savefig(output / filename, dpi=300); plt.close(fig)
+        fig.tight_layout(); fig.savefig(output / filename, dpi=300)
+        fig.savefig((output / filename).with_suffix(".pdf")); plt.close(fig)
 
     simple_bar("balanced_accuracy", "Balanced accuracy", "experiment_1_balanced_accuracy.png")
     simple_bar("nll", "Negative log-likelihood", "experiment_1_nll.png")
@@ -267,7 +397,8 @@ def _make_plots(output: Path, experiment_1: Sequence[Mapping[str, Any]],
                label=display[architecture], color=colors[architecture])
     ax.set_xticks(x, [str(label) for label in class_ids], rotation=25, ha="right")
     ax.set_ylabel("Recall"); ax.legend(frameon=False); ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout(); fig.savefig(output / "experiment_1_per_class_recall.png", dpi=300); plt.close(fig)
+    fig.tight_layout(); fig.savefig(output / "experiment_1_per_class_recall.png", dpi=300)
+    fig.savefig(output / "experiment_1_per_class_recall.pdf"); plt.close(fig)
 
     methods = ("instantaneous", "ema", "bayes")
     e2 = {(row["architecture"], row["temporal_method"]): row for row in experiment_2}
@@ -282,7 +413,8 @@ def _make_plots(output: Path, experiment_1: Sequence[Mapping[str, Any]],
                    label=display[architecture], color=colors[architecture])
         ax.set_xticks(x, ("Instantaneous", "EMA", "Bayes"))
         ax.set_ylabel(ylabel); ax.legend(frameon=False); ax.grid(axis="y", alpha=0.25)
-        fig.tight_layout(); fig.savefig(output / filename, dpi=300); plt.close(fig)
+        fig.tight_layout(); fig.savefig(output / filename, dpi=300)
+        fig.savefig((output / filename).with_suffix(".pdf")); plt.close(fig)
 
     grouped_bar("balanced_accuracy", "Balanced accuracy", "experiment_2_balanced_accuracy.png")
     grouped_bar("transition_window_accuracy", "Transition-window accuracy (±5)",
@@ -305,7 +437,8 @@ def _make_plots(output: Path, experiment_1: Sequence[Mapping[str, Any]],
                         xytext=(4, 4), textcoords="offset points", fontsize=8)
     ax.set_xlabel("Mean transition delay (frames)"); ax.set_ylabel("Balanced accuracy")
     ax.grid(alpha=0.25); fig.tight_layout()
-    fig.savefig(output / "experiment_2_accuracy_delay_scatter.png", dpi=300); plt.close(fig)
+    fig.savefig(output / "experiment_2_accuracy_delay_scatter.png", dpi=300)
+    fig.savefig(output / "experiment_2_accuracy_delay_scatter.pdf"); plt.close(fig)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -322,6 +455,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--quiet-training", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--plot-only", type=Path, metavar="BUNDLE", help="Regenerate all figures from figure_data.pt only")
+    modes.add_argument("--bundle-from-existing", type=Path, metavar="OFFLINE_DIR", help="Evaluate saved checkpoints into a new bundle without training")
     parser.add_argument("--allow-legacy-provenance", action="store_true",
                         help="Explicit unverified per_eps fallback for historical compiled datasets")
     args = parser.parse_args(argv)
@@ -332,6 +468,21 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
+    if args.plot_only:
+        from .paper_figure_bundle import load_bundle, plot_bundle
+        bundle = load_bundle(args.plot_only)
+        args.output.mkdir(parents=True, exist_ok=True)
+        _make_plots(args.output, bundle["experiment_1_summary"], bundle["experiment_2_summary"], bundle["class_ordering"])
+        report = plot_bundle(bundle, args.output)
+        report["bundle"] = str(args.plot_only.resolve())
+        save_results(args.output / "figure_manifest.json", report)
+        for reason in report["unavailable"]:
+            print("Figure input unavailable:", reason)
+        print("Figures regenerated from bundle only:", args.output)
+        return
+    if args.bundle_from_existing:
+        _bundle_from_existing(args)
+        return
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
     if device == "auto":
         device = "cpu"
@@ -393,6 +544,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     feature_preprocessing_peak_mb = peak_memory_mb(device)
 
     experiment_1_rows, experiment_2_rows, training_records = [], [], []
+    figure_runs = []
     transition_records = []
     raw_train = raw_validation = None
     for architecture in ("feature_nn", "raw_depth_nn"):
@@ -564,8 +716,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "per_class_recall": instant["per_class_recall"],
                 "confusion_matrix": json_safe(instant["confusion_matrix"]),
             })
-            for method, metrics in _sequential_metrics(
-                    classifier, ordered_logits, ordered_test["labels"], ordered_ids).items():
+            trace = {}
+            sequential_metrics = _sequential_metrics(
+                classifier, ordered_logits, ordered_test["labels"], ordered_ids, trace_sink=trace)
+            figure_runs.append({"architecture": architecture, "seed": seed, "trace": trace,
+                                "model_path": str(model_path), "model_args": model.get_args(),
+                                "structural_logits": structural_logits.squeeze(0).cpu(),
+                                "structural_probabilities": structural_logits.squeeze(0).cpu().softmax(-1)})
+            for method, metrics in sequential_metrics.items():
                 experiment_2_rows.append({
                     "architecture": architecture, "temporal_method": method,
                     "seed": seed, "model_path": str(model_path),
@@ -602,8 +760,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     _write_rows(output / "experiment_2_transitions_v2.csv", transition_records, TRANSITION_RECORD_FIELDS)
     save_results(output / "experiment_2_transitions_v2.json", transition_records)
     _make_plots(output, experiment_1_summary, experiment_2_summary, class_ids)
+    figure_info = _write_figure_bundle(output, structural_test, ordered_test, ordered_ids, extractor,
+        figure_runs, experiment_1_rows, experiment_2_rows, experiment_1_summary, experiment_2_summary,
+        class_ids, {"fixed_models": FIXED_MODEL_CONFIGS,
+                    "extractor": torch.load(feature_artifacts / "extractor.pt", map_location="cpu", weights_only=False),
+                    "standardizer": torch.load(feature_artifacts / "standardizer.pt", map_location="cpu", weights_only=False)})
 
     manifest = {
+        "figures": figure_info,
         "provenance_checks": provenance_checks,
         "ordered_provenance_checks": ordered_provenance_checks,
         "legacy_provenance_fallback": args.allow_legacy_provenance,
