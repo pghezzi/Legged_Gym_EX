@@ -1,11 +1,13 @@
 """Launcher-only tests. Opt-in real Docker tests never import/run experiments."""
 import os
+import json
 from pathlib import Path
 import shutil
 import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "legged_gym/scripts/run_paper_experiments_docker.sh"
@@ -67,6 +69,106 @@ class PaperDockerLauncherTests(unittest.TestCase):
         result = self.launch("plot-only", "--bundle", self.inputs / "figure_data.pt", "--gpu", "none", "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("--gpus", result.stdout)
+
+    def test_cost_only_paths_and_no_experiment_commands(self):
+        sidecar = self.inputs / "capture.pt.training_cost.json"
+        sidecar.write_text("{}")
+        result = self.launch("cost-only", "--paper-offline-dir", self.offline,
+                             "--collection-cost", sidecar, "--compilation-cost", self.inputs,
+                             "--distillation-run", self.inputs,
+                             "--path-map", "/old workspace/data", self.inputs,
+                             "--deployment-artifact", "distilled:0", self.inputs / "distilled.pt",
+                             "--gpu", "none", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("summarize_training_costs", result.stdout)
+        self.assertIn("/paper/costs", result.stdout)
+        self.assertIn("/inputs/offline", result.stdout)
+        self.assertIn("readonly", result.stdout)
+        self.assertIn("--no-auto-distillation", result.stdout)
+        self.assertNotIn("evaluate_paper_offline_experiments_1_2", result.stdout)
+        self.assertNotIn("run_paper_locomotion_evaluation", result.stdout)
+        self.assertFalse((self.root / "outputs").exists())
+
+    def test_evaluation_failure_still_audits_and_preserves_first_exit(self):
+        fake_bin = self.root / "bin"
+        fake_bin.mkdir()
+        docker = fake_bin / "docker"
+        docker.write_text("#!/usr/bin/env bash\nset -eu\n"
+                          "while (($#)); do\n"
+                          "  if [[ $1 == paper ]]; then\n"
+                          "    case $2 in offline) exit 0;; locomotion) exit 7;; costs) exit 4;; esac\n"
+                          "  fi\n  shift\ndone\nexit 99\n")
+        docker.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]}):
+            result = self.launch("all", *self.common())
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        run = self.root / "outputs/test-run"
+        self.assertEqual((run / "logs/costs.exit_status").read_text().strip(), "4")
+        self.assertEqual((run / "exit_status").read_text().strip(), "7")
+        self.assertEqual(len((run / "commands.sh").read_text().splitlines()), 3)
+
+    @unittest.skipUnless(os.environ.get("RUN_DOCKER_COSTS") == "1" and shutil.which("docker"), "opt-in real cost aggregation")
+    def test_real_cost_only_without_experiments(self):
+        training = []
+        for architecture, method in (("feature_nn", "Feature Router"), ("raw_depth_nn", "Raw-Depth Router")):
+            for seed in range(3):
+                training.append(dict(architecture=architecture, seed=seed))
+                record = dict(run_type="classifier_training", architecture=architecture, method=method,
+                              seed=seed, optimization_s=2., timing_schema_version=2,
+                              metric_status={"optimization_s": "measured"})
+                (self.offline / f"artifacts/{architecture}/seed_{seed}/training_cost.json").write_text(json.dumps(record))
+        manifest = self.offline / "manifest.json"
+        manifest.write_text(json.dumps(dict(training_runs=training, structural_dataset="/not-mounted/compiled")))
+        before = manifest.read_bytes()
+        result = self.launch("cost-only", "--paper-offline-dir", self.offline, "--gpu", "none")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        run = self.root / "outputs/test-run"
+        self.assertTrue((run / "costs/training_cost_manifest.json").is_file())
+        audit = json.loads((run / "costs/training_cost_manifest.json").read_text())
+        self.assertTrue(all(r["total_wallclock_s"] is None for r in audit["per_run_records"]))
+        self.assertEqual(len(audit["per_run_records"]), 6)
+        self.assertIn("summarize_training_costs", (run / "commands.sh").read_text())
+        self.assertFalse((run / "logs/offline.log").exists())
+        self.assertFalse((run / "logs/locomotion.log").exists())
+        self.assertEqual((run / "logs/costs.exit_status").read_text().strip(), "0")
+        self.assertEqual(manifest.read_bytes(), before)
+        for path in (run / "costs").rglob("*"):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o777 if path.is_dir() else 0o666)
+        # Relocate the complete preparation graph; duplicate source references
+        # must still count once even through two historic path aliases.
+        def timing(kind, dataset, seconds, **extra):
+            return dict(run_type=kind, dataset_path=dataset, timing_schema_version=2,
+                        total_wallclock_s=seconds, gpu_hours=0., gpu_count=0,
+                        setup_s=0., data_generation_s=0., preprocessing_s=0.,
+                        optimization_s=seconds, artifact_serialization_s=0., overhead_s=0., **extra)
+        for row in training:
+            path = self.offline / f"artifacts/{row['architecture']}/seed_{row['seed']}/training_cost.json"
+            original = json.loads(path.read_text())
+            original.update(timing("classifier_training", "unused", 2.))
+            path.write_text(json.dumps(original))
+        compiled = self.inputs / "compiled"
+        compiled.mkdir()
+        compilation = compiled / "training_cost.json"
+        compilation.write_text(json.dumps(timing("dataset_compilation", "/recorded/compiled", 3.,
+                                                source_files=["/recorded/raw.pt", "/alias/raw.pt"])))
+        collection = self.inputs / "raw.pt.training_cost.json"
+        collection.write_text(json.dumps(timing("classifier_data_collection", "/recorded/raw.pt", 5., data_env_steps=12)))
+        manifest.write_text(json.dumps(dict(training_runs=training, structural_dataset="/recorded/compiled")))
+        before = {path: path.read_bytes() for path in (manifest, compilation, collection)}
+        result = self.launch("cost-only", "--paper-offline-dir", self.offline, "--gpu", "none", "--run-id", "relocated",
+                             "--collection-cost", collection, "--compilation-cost", compiled,
+                             "--path-map", "/recorded", self.inputs, "--path-map", "/alias", self.inputs)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        audit = json.loads((self.root / "outputs/relocated/costs/training_cost_manifest.json").read_text())
+        self.assertTrue(all(r["total_wallclock_s"] == 10. for r in audit["per_run_records"]))
+        self.assertTrue(all(r["data_env_steps"] == 12 for r in audit["per_run_records"]))
+        self.assertTrue(all(path.read_bytes() == data for path, data in before.items()))
+        manifest.write_text("invalid JSON")
+        result = self.launch("cost-only", "--paper-offline-dir", self.offline, "--gpu", "none", "--run-id", "cost-failure")
+        self.assertNotEqual(result.returncode, 0)
+        failure = self.root / "outputs/cost-failure"
+        self.assertEqual(int((failure / "logs/costs.exit_status").read_text()), result.returncode)
+        self.assertEqual(stat.S_IMODE((failure / "logs/costs.log").stat().st_mode), 0o666)
 
     def test_invalid_paths_overrides_and_existing_run_rejected(self):
         for args in (("--output",), ("--out=/tmp/escape",), ("--classifier-d",)):

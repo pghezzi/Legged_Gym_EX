@@ -3,6 +3,7 @@ import importlib.util
 import ast
 import json
 import math
+import os
 from pathlib import Path
 import runpy
 import sys
@@ -90,6 +91,90 @@ def test_legacy_timings_and_partial_seed_summaries_stay_unavailable(tmp_path):
     assert rows[0]["total_wallclock_s_mean"] is None
 
 
+def test_relocated_provenance_and_shared_aliases_are_read_only(tmp_path):
+    offline, compiled, sidecars = tmp_path / "offline", tmp_path / "compiled", tmp_path / "sidecars"
+    raw = tmp_path / "raw.pt"
+    raw_cost = sidecars / "raw.pt.training_cost.json"
+    compile_cost = compiled / "training_cost.json"
+    write(raw_cost, record("classifier_data_collection", "/archive/raw.pt", 10.))
+    write(compile_cost, record("dataset_compilation", "/archive/compiled", 3.,
+                              source_files=["/archive/raw.pt", "/alias/raw.pt"]))
+    write(offline / "manifest.json", {"structural_dataset": "/archive/compiled",
+                                      "structural_split_manifest": "/archive/compiled/split_manifest.json"})
+    write(compiled / "split_manifest.json", {"calibration_source_file": "/alias/raw.pt"})
+    resolver = summary.PathResolver([("/archive", tmp_path), ("/alias/raw.pt", raw)])
+    originals = {p: p.read_bytes() for p in (raw_cost, compile_cost, offline / "manifest.json")}
+    preparation = summary._preparation_records(offline, [raw_cost, compile_cost], resolver=resolver)
+    assert len(preparation) == 2  # Shared training/calibration source charged once.
+    classifier = record("classifier_training", tmp_path / "model.pt", 2., method="Feature Router")
+    result = summary._compose_router_run(classifier, preparation)
+    assert result["total_wallclock_s"] == pytest.approx(15.)
+    assert result["data_env_steps"] == 10
+    assert result["collection_run_ids"] == [str(raw)]
+    assert all(path.read_bytes() == before for path, before in originals.items())
+    raw_cost.unlink()
+    missing = summary._compose_router_run(classifier, summary._preparation_records(offline, [compile_cost], resolver=resolver))
+    assert missing["total_wallclock_s"] is None and missing["data_env_steps"] is None
+
+
+def test_relocated_relative_sidecar_and_prefix_boundaries(tmp_path):
+    moved = tmp_path / "isolated" / "capture.training_cost.json"
+    resolver = summary.PathResolver([("/host/data", tmp_path / "data"),
+                                     ("/host/data/capture.training_cost.json", moved)])
+    assert resolver.resolve("/host/data-other/a") == Path("/host/data-other/a")
+    assert resolver.resolve("/host/data/capture.training_cost.json") == moved
+    assert resolver.resolve("capture.pt", resolver.record_dir(moved)) == tmp_path / "data/capture.pt"
+    with pytest.raises(ValueError, match="absolute"):
+        summary.PathResolver([("relative", tmp_path)])
+
+
+def test_deployment_files_exclude_training_checkpoints_and_deduplicate(tmp_path):
+    offline = tmp_path / "offline"
+    records = [{"method": method, "seed": 0, "artifact_size_mb": 999.} for method in summary.METHODS]
+    paths = [offline / "manifest.json", offline / "artifacts/feature_nn/extractor.pt",
+             offline / "artifacts/feature_nn/standardizer.pt"]
+    for architecture in ("feature_nn", "raw_depth_nn"):
+        paths += [offline / f"artifacts/{architecture}/seed_0/{name}" for name in ("classifier.pt", "nn_model_args.pt")]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * 1024)
+    export = tmp_path / "student.pt"
+    export.write_bytes(b"x" * 2048)
+    alias = tmp_path / "student_alias.pt"
+    os.link(export, alias)
+    summary._deployment_sizes(records, offline, [("distilled:0", export), ("distilled:0", alias)])
+    assert [r["deployment_size_mb"] for r in records] == [5/1024, 3/1024, 2/1024]
+    assert all(r["artifact_size_mb"] == 999. for r in records)
+    export.unlink()
+    summary._deployment_sizes(records, offline, [("distilled:0", export)])
+    assert records[-1]["deployment_size_mb"] is None
+    assert records[-1]["metric_status"]["deployment_size_mb"] == "unavailable"
+
+
+def test_cost_aggregation_only_never_loads_models_or_evaluates(tmp_path, monkeypatch):
+    offline, compiled = tmp_path / "offline", tmp_path / "compiled"
+    raw = tmp_path / "raw.pt"
+    write(Path(str(raw) + ".training_cost.json"), record("classifier_data_collection", raw, 10.))
+    write(compiled / "training_cost.json", record("dataset_compilation", compiled, 3., source_files=[str(raw)]))
+    training = []
+    for architecture, method in zip(("feature_nn", "raw_depth_nn"), summary.METHODS):
+        for seed in range(3):
+            training.append(dict(architecture=architecture, seed=seed))
+            write(offline / f"artifacts/{architecture}/seed_{seed}/training_cost.json",
+                  record("classifier_training", offline, 2., method=method, architecture=architecture, seed=seed))
+    write(offline / "manifest.json", dict(structural_dataset=str(compiled), training_runs=training,
+                                        evaluation_runtime_seconds=123456789))
+    monkeypatch.setattr(torch, "load", lambda *a, **kw: pytest.fail("Model inference/loading must not be needed"))
+    monkeypatch.setattr(summary, "_plots", lambda *args: [])
+    output = tmp_path / "costs"
+    summary.main(["--paper-offline-dir", str(offline), "--output", str(output), "--no-auto-distillation"])
+    audit = json.loads((output / "training_cost_manifest.json").read_text())
+    assert len(audit["per_run_records"]) == 6
+    assert all(r["total_wallclock_s"] == 15. for r in audit["per_run_records"])
+    assert all(r["deployment_size_mb"] is None for r in audit["per_run_records"])
+    assert (output / "training_cost_comparison.tex").is_file()
+
+
 def test_tables_and_stacked_figures_include_all_stages(tmp_path):
     records = []
     for method in summary.METHODS:
@@ -117,7 +202,7 @@ def test_compiler_writes_reconciling_sidecar(tmp_path, monkeypatch):
                 "base_ang_vel": torch.zeros(frames, envs, 3),
                 "terrain_name": [["rough"] * envs for _ in range(frames)]}, raw)
     monkeypatch.setattr(legged_gym, "LEGGED_GYM_ROOT_DIR", str(tmp_path))
-    monkeypatch.setattr(sys, "argv", ["compile_depth_data", "--files", str(raw), "--frac", "1"])
+    monkeypatch.setattr(sys, "argv", ["compile_depth_data", "--files", str(raw), "--frac", "1", "--allow-legacy-provenance"])
     runpy.run_path(str(ROOT / "legged_gym/scripts/depth_data_pipeline/compile_depth_data.py"), run_name="__main__")
     sidecar = next(tmp_path.rglob("training_cost.json"))
     result = json.loads(sidecar.read_text())
@@ -183,15 +268,15 @@ def test_classifier_accounts_loading_but_excludes_sequence_preparation(tmp_path,
             tick(5.)
             self.training_history = dict(epochs_completed=1, optimizer_updates=1,
                 best_epoch=0, stopped_early=False, best_weights_restored=True)
-    def sequence_ids(data):
+    def sequence_ids(data, **kwargs):
         tick(10000.)  # Must not inflate any integration stage or total.
         return []
     args = SimpleNamespace(dataset=tmp_path, classifier_data=tmp_path / "structural",
         ordered_data=tmp_path / "ordered", output=tmp_path / "out", device="cpu",
-        batch_size=4, quiet_training=True)
+        batch_size=4, quiet_training=True, plot_only=None, bundle_from_existing=None, allow_legacy_provenance=True)
     namespace = dict(Sequence=list, torch=torch, nn=torch.nn, math=math,
         _parse_args=lambda argv: args, _resolve_data_folder=lambda folder, *args: folder,
-        _labels=lambda labels: labels, sequence_ids_for=sequence_ids,
+        _labels=lambda labels: labels, sequence_ids_for=sequence_ids, validate_partitions=lambda *a, **kw: {},
         make_terrain_extractor=lambda path: Artifact(), extract_dataset_features=features,
         fit_standardizer=lambda *a, **kw: Artifact(), pack_raw_depth_state_inputs=features,
         _set_seed=lambda seed: None, MODEL_SEEDS=(0, 1),

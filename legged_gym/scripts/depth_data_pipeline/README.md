@@ -206,6 +206,66 @@ experiment. Automated checks: `RUN_DOCKER_SMOKE=1 python -m unittest discover
 -s tests -p test_paper_experiments_docker.py` (uses local `ubuntu:20.04`, overridable
 with `PAPER_SMOKE_IMAGE`). No full sweep is needed to test the launcher.
 
+### Automatic training-cost audit and relocated inputs
+
+`offline`, `locomotion`, and `all` now automatically aggregate post-specialist
+training costs into the new run's `costs/` directory. `plot-only` does so only
+when `--paper-offline-dir` is also supplied. No evaluation runtime is used as
+training cost. Missing collection/compilation/training records leave totals
+unavailable, rather than zero. A locomotion failure still permits the independent
+cost audit when offline results exist, while preserving the evaluation exit code.
+
+Add these repeatable options to any applicable launch:
+
+```bash
+  --collection-cost /data/capture.pt.training_cost.json \
+  --compilation-cost /data/compiled/training_cost.json \
+  --distillation-run /models/distill_seed_0 \
+  --distillation-run /models/distill_seed_1 \
+  --distillation-run /models/distill_seed_2 \
+  --deployment-artifact distilled:0 /models/student_seed_0.pt
+```
+
+Aggregate existing runs without training or evaluation:
+
+```bash
+bash legged_gym/scripts/run_paper_experiments_docker.sh cost-only \
+  --paper-offline-dir /data/paper_runs/offline_v1/offline --gpu none \
+  --collection-cost /data/capture.pt.training_cost.json \
+  --compilation-cost /data/compiled/training_cost.json \
+  --path-map /inputs/classifier /data/compiled \
+  --distillation-run /models/distill_seed_0 \
+  --deployment-artifact distilled:0 /models/student_seed_0.pt \
+  --output-root /data/paper_runs --run-id cost_audit_v1
+```
+
+All additional inputs are read-only. `--path-map RECORDED_PREFIX HOST_PATH`
+mounts the current host file/directory and resolves references recorded under an
+old host/container prefix; repeat for other relocated roots. Longest matching
+prefix wins. Current host mounts and the previous `/paper/offline` location are
+mapped automatically. Original manifests/sidecars are never edited. Resolved
+identities deduplicate sources shared by training/calibration; unreferenced
+ordered-test collection is not charged. Mappings are recorded in commands and
+`costs/training_cost_manifest.json`. Raw image files are not needed if their
+linked sidecars/provenance are supplied. Missing optional data stays unavailable.
+
+Deployment accounting adds `deployment_size_mb` (MiB) without replacing the
+historical `artifact_size_mb` training-checkpoint field. Router sizes include
+the frozen loader's manifest, classifier/model arguments, and feature
+extractor/standardizer when applicable. Training optimizer checkpoints and
+pre-existing specialists are not added. Explicit exports can be supplied with
+`--deployment-artifact feature_nn[:SEED]|raw_depth_nn[:SEED]|distilled[:SEED] FILE`;
+repeat for split exports. Unscoped files are explicitly shared by that method's
+runs; use `:0`, `:1`, `:2` for independent seed exports. Locomotion's
+`--distilled-jit` is the shared export reference unless explicit distilled
+artifacts are provided. Missing deployment components make their total
+unavailable. Files are counted once per deployment, not summed across alternatives.
+
+Cost CSV/JSON, LaTeX, and PNG/PDF outputs retain the same universal permissions.
+See `logs/costs.log`, `logs/costs.exit_status`, and `commands.sh`. To test real
+cost-only aggregation on synthetic relocated sidecars (no experiments):
+`RUN_DOCKER_COSTS=1 python -m unittest discover -s tests -p test_paper_experiments_docker.py`.
+
 To train exactly three deterministic seeded copies of the fixed feature/raw-depth
 NNs and evaluate instantaneous, fixed EMA, and fixed persistent-Bayes results
 without running any search:

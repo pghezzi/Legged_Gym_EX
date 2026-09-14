@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -27,14 +28,51 @@ CORE_FIELDS = (
     "total_post_specialist_env_steps", "data_generation_s", "preprocessing_s",
     "optimization_s", "setup_s", "artifact_serialization_s", "overhead_s", "compilation_s",
     "total_wallclock_s", "gpu_hours", "peak_gpu_memory_mb",
-    "trainable_params", "training_samples", "artifact_size_mb",
+    "trainable_params", "training_samples", "artifact_size_mb", "deployment_size_mb",
 )
 TABLE_FIELDS = (
     "data_env_steps", "additional_locomotion_policy_env_steps",
     "total_post_specialist_env_steps", "setup_s", "data_generation_s", "preprocessing_s",
     "optimization_s", "artifact_serialization_s", "overhead_s", "compilation_s",
-    "total_wallclock_s", "gpu_hours", "peak_gpu_memory_mb", "trainable_params",
+    "total_wallclock_s", "gpu_hours", "peak_gpu_memory_mb", "trainable_params", "deployment_size_mb",
 )
+
+
+class PathResolver:
+    """Explicit longest-prefix relocation; never rewrite an input record/file."""
+
+    def __init__(self, mappings=()):
+        self.mappings = {}
+        for source, destination in mappings:
+            source, destination = Path(source).expanduser(), Path(destination).expanduser()
+            if not source.is_absolute() or not destination.is_absolute():
+                raise ValueError("Path mappings must use absolute recorded and local paths")
+            self.mappings[Path(os.path.normpath(source))] = Path(os.path.normpath(destination))
+
+    @staticmethod
+    def _map(path, mappings):
+        for source, destination in sorted(mappings, key=lambda pair: len(pair[0].parts), reverse=True):
+            try:
+                return destination / path.relative_to(source)
+            except ValueError:
+                continue
+        return path
+
+    def resolve(self, value, owner=None):
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = (owner or Path.cwd()) / path
+        path = Path(os.path.normpath(path))
+        return self._map(path, self.mappings.items()).resolve()
+
+    def record_dir(self, local_file):
+        # Single sidecars can be mounted separately from the data they describe.
+        # Relative references belong to their original directory, not /inputs/0.
+        return self._map(Path(local_file), [(dst, src) for src, dst in self.mappings.items()]).parent
+
+    def metadata(self):
+        return [{"recorded_prefix": str(src), "resolved_prefix": str(dst)}
+                for src, dst in self.mappings.items()]
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -150,15 +188,17 @@ def _legacy_classifier_record(
     return result
 
 
-def _classifier_records(offline_dir: Path) -> list[dict[str, Any]]:
+def _classifier_records(offline_dir: Path, resolver=None) -> list[dict[str, Any]]:
+    resolver = resolver or PathResolver()
     manifest_path = offline_dir / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Missing offline manifest: {manifest_path}")
     manifest = _load(manifest_path)
     split_counts = {}
     split_path = manifest.get("structural_split_manifest")
-    if split_path and Path(split_path).is_file():
-        split_manifest = _load(Path(split_path))
+    split_path = resolver.resolve(split_path, resolver.record_dir(manifest_path)) if split_path else None
+    if split_path and split_path.is_file():
+        split_manifest = _load(split_path)
         split_counts = {
             name: values.get("num_frames")
             for name, values in split_manifest.get("splits", {}).items()
@@ -177,7 +217,11 @@ def _classifier_records(offline_dir: Path) -> list[dict[str, Any]]:
         source.setdefault("training_samples", split_counts.get("train"))
         source.setdefault("validation_samples", split_counts.get("val"))
         source.setdefault("test_samples", split_counts.get("test"))
-        model_path = Path(source.get("model_path", ""))
+        model_path = resolver.resolve(source.get("model_path", ""), resolver.record_dir(manifest_path))
+        if not model_path.is_file():
+            model_path = sidecar.parent / "classifier.pt"
+        source["recorded_model_path"] = source.get("model_path")
+        source["model_path"] = str(model_path)
         if model_path.is_file() and source.get("trainable_params") is None:
             try:
                 checkpoint = torch.load(
@@ -358,26 +402,26 @@ def _distillation_records(paths: Sequence[Path]) -> list[dict[str, Any]]:
     return results
 
 
-def _preparation_records(offline_dir: Path, explicit: Sequence[Path], dataset=None):
+def _preparation_records(offline_dir: Path, explicit: Sequence[Path], dataset=None, resolver=None):
     """Walk only training-dataset provenance; deduplicate artifacts, not filenames.
 
     Missing known inputs get placeholder records so partial discovery cannot be
     mistaken for a complete (or free) integration pipeline.
     """
+    resolver = resolver or PathResolver()
+    resolve = resolver.resolve
     manifest = _load(offline_dir / "manifest.json")
-    def resolve(value, owner):
-        path = Path(value).expanduser()
-        return (path if path.is_absolute() else owner / path).resolve()
+    manifest_owner = resolver.record_dir(offline_dir / "manifest.json")
     indexed = {}
     for sidecar in _find_sidecars(explicit, "training_cost.json"):
         record = _load(sidecar)
         if record.get("run_type") in ("classifier_data_collection", "dataset_compilation"):
             if record.get("dataset_path"):
-                indexed[resolve(record["dataset_path"], sidecar.parent)] = (record, sidecar)
+                indexed[resolve(record["dataset_path"], resolver.record_dir(sidecar))] = (record, sidecar)
     root = dataset or manifest.get("structural_dataset")
     split_ref = manifest.get("structural_split_manifest")
     if root is None and split_ref:
-        root = str(resolve(split_ref, offline_dir).parent)
+        root = str(resolve(split_ref, manifest_owner).parent)
     results, seen = [], set()
     def visit(path, compiled=False):
         path = path.resolve()
@@ -392,13 +436,15 @@ def _preparation_records(offline_dir: Path, explicit: Sequence[Path], dataset=No
             if candidate.get("run_type") == expected:
                 record = candidate
         result = dict(record) if record else {"run_type": expected, "dataset_path": str(path)}
+        result["recorded_dataset_path"] = result.get("dataset_path")
+        result["dataset_path"] = str(path)  # Canonical identity for shared-source deduplication.
         result["cost_sidecar"] = str(sidecar)
         results.append(result)
         if not compiled:
             return
         split_path = path / "split_manifest.json"
-        if split_ref and path == resolve(root, offline_dir):
-            split_path = resolve(split_ref, offline_dir)
+        if split_ref and path == resolve(root, manifest_owner):
+            split_path = resolve(split_ref, manifest_owner)
         split = _load(split_path) if split_path.is_file() else {}
         sources = (record or {}).get("source_files") or split.get("source_files") or split.get("sources", [])
         sources = [item.get("source_file") if isinstance(item, dict) else item for item in sources]
@@ -409,15 +455,17 @@ def _preparation_records(offline_dir: Path, explicit: Sequence[Path], dataset=No
             results.append({"run_type": "classifier_data_collection", "dataset_path": None})
         for source in sources:
             if source:
-                source_path = resolve(source, split_path.parent)
+                owner = resolver.record_dir(sidecar if (record or {}).get("source_files") else split_path)
+                source_path = resolve(source, owner)
                 # Also support compiled inputs in chained dataset pipelines.
                 is_compiled = source_path.is_dir() or indexed.get(source_path, ({},))[0].get("run_type") == "dataset_compilation"
                 visit(source_path, compiled=is_compiled)
     if root:
-        visit(resolve(root, offline_dir), compiled=True)
+        visit(resolve(root, manifest_owner), compiled=True)
     else:
         # Explicit historical records can recover costs, but compilation remains unknown.
-        results = [dict(record, cost_sidecar=str(sidecar)) for record, sidecar in indexed.values()]
+        results = [dict(record, recorded_dataset_path=record.get("dataset_path"), dataset_path=str(path),
+                        cost_sidecar=str(sidecar)) for path, (record, sidecar) in indexed.items()]
         if not any(r.get("run_type") == "dataset_compilation" for r in results):
             results.append({"run_type": "dataset_compilation", "dataset_path": None})
         if not any(r.get("run_type") == "classifier_data_collection" for r in results):
@@ -466,6 +514,55 @@ def _compose_router_run(classifier: Mapping[str, Any],
     result["collection_run_ids"] = [r.get("dataset_path") for r in collection]
     result["compilation_run_ids"] = [r.get("dataset_path") for r in compilation]
     return result
+
+
+def _deployment_sizes(records, offline_dir, artifacts=(), resolver=None):
+    """On-disk deployable files, separate from legacy training-checkpoint size.
+
+    Router files match the existing frozen loader. Distillation exports must be
+    supplied explicitly: never call a critic/optimizer checkpoint a deployment.
+    A method-wide argument is an explicitly shared file; :SEED scopes an export.
+    """
+    resolver = resolver or PathResolver()
+    names = {"feature_nn": METHODS[0], "raw_depth_nn": METHODS[1], "distilled": METHODS[2]}
+    supplied = []
+    for target, value in artifacts:
+        architecture, separator, seed = target.partition(":")
+        if architecture not in names or (separator and not seed.isdigit()):
+            raise ValueError(f"Invalid deployment target: {target}; use feature_nn/raw_depth_nn/distilled[:SEED]")
+        path = resolver.resolve(value)
+        supplied.append({"target": target, "method": names[architecture],
+                         "seed": int(seed) if separator else None,
+                         "recorded_path": str(value), "resolved_path": str(path),
+                         "size_mb": artifact_size_mb(path)})
+    for record in records:
+        paths = []
+        if record.get("method") in METHODS[:2]:
+            architecture = "feature_nn" if record["method"] == METHODS[0] else "raw_depth_nn"
+            root = offline_dir / "artifacts" / architecture
+            seeded = root / f"seed_{record.get('seed')}"
+            paths = [offline_dir / "manifest.json", seeded / "classifier.pt", seeded / "nn_model_args.pt"]
+            if architecture == "feature_nn":
+                paths += [root / "extractor.pt", root / "standardizer.pt"]
+        paths += [Path(item["resolved_path"]) for item in supplied
+                  if item["method"] == record.get("method") and item["seed"] in (None, record.get("seed"))]
+        components, seen_files = [], set()
+        for path in dict.fromkeys(p.resolve() for p in paths):
+            # Repeated Docker bind mounts can expose the same file at different
+            # absolute paths; do not charge that deployment component twice.
+            info = path.stat() if path.is_file() else None
+            identity = (info.st_dev, info.st_ino) if info else str(path)
+            if identity in seen_files:
+                continue
+            seen_files.add(identity)
+            size = artifact_size_mb(path)
+            components.append({"path": str(path), "size_mb": size,
+                               "status": "measured" if size is not None else "unavailable"})
+        available = bool(components) and all(item["size_mb"] is not None for item in components)
+        record["deployment_size_mb"] = sum(item["size_mb"] for item in components) if available else None
+        record["deployment_artifacts"] = components
+        record.setdefault("metric_status", {})["deployment_size_mb"] = "measured" if available else "unavailable"
+    return supplied
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -596,6 +693,7 @@ def _write_table(output: Path, summary: Sequence[Mapping[str, Any]]) -> None:
         "gpu_hours": "GPU-hours",
         "peak_gpu_memory_mb": "Peak GPU MB",
         "trainable_params": "Parameters",
+        "deployment_size_mb": "Deployment (MiB)",
     }
     columns = ["Method", *(labels[key] for key in TABLE_FIELDS)]
     lines = [
@@ -727,6 +825,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--collection-cost", type=Path, nargs="*", default=[])
     parser.add_argument("--compilation-cost", type=Path, nargs="*", default=[])
     parser.add_argument("--distillation-run", type=Path, nargs="*", default=[])
+    parser.add_argument("--path-map", nargs=2, action="append", default=[], metavar=("RECORDED", "LOCAL"),
+                        help="Read-only path relocation, longest absolute prefix wins; repeat as needed")
+    parser.add_argument("--deployment-artifact", nargs=2, action="append", default=[], metavar=("METHOD[:SEED]", "FILE"),
+                        help="Additional deployable file: feature_nn, raw_depth_nn or distilled, optionally :SEED")
+    parser.add_argument("--no-auto-distillation", action="store_true",
+                        help="Use only explicitly supplied distillation records (no cwd/logs discovery)")
     parser.add_argument(
         "--output", type=Path, default=Path("training_cost_audit")
     )
@@ -736,14 +840,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
-    offline_dir = args.paper_offline_dir.expanduser().resolve()
+    resolver = PathResolver(args.path_map)
+    offline_dir = resolver.resolve(args.paper_offline_dir)
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    classifier_components = _classifier_records(offline_dir)
+    classifier_components = _classifier_records(offline_dir, resolver)
     router_records, preparation_records = [], []
     for record in classifier_components:
         preparation = _preparation_records(offline_dir,
-            [*args.collection_cost, *args.compilation_cost], record.get("structural_dataset"))
+            [resolver.resolve(p) for p in [*args.collection_cost, *args.compilation_cost]],
+            record.get("structural_dataset"), resolver)
         preparation_records.extend(preparation)
         router_records.append(_compose_router_run(record, preparation))
     collection_paths = sorted({Path(r["cost_sidecar"]) for r in preparation_records
@@ -751,19 +857,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     compilation_paths = sorted({Path(r["cost_sidecar"]) for r in preparation_records
                                 if r.get("run_type") == "dataset_compilation" and r.get("cost_sidecar")})
     collection_records = [r for r in preparation_records if r.get("run_type") == "classifier_data_collection"]
-    distillation_inputs = list(args.distillation_run)
-    if not distillation_inputs and (Path.cwd() / "logs").is_dir():
+    distillation_inputs = [resolver.resolve(path) for path in args.distillation_run]
+    if not distillation_inputs and not args.no_auto_distillation and (Path.cwd() / "logs").is_dir():
         distillation_inputs = [Path.cwd() / "logs"]
     distillation_records = _distillation_records(distillation_inputs)
     for record in distillation_records:
         record["compilation_s"] = 0.0  # Online rollout storage; no offline dataset compilation.
         record.setdefault("metric_status", {})["compilation_s"] = "measured"
     per_run = [*router_records, *distillation_records]
+    deployment_inputs = _deployment_sizes(per_run, offline_dir, args.deployment_artifact, resolver)
     summary = _aggregate(per_run)
     _write_csv(output / "training_cost_per_run.csv", per_run)
     _write_csv(output / "training_cost_summary.csv", summary)
     _write_table(output, summary)
-    figures = _plots(output, summary, args.locomotion_summary)
+    figures = _plots(output, summary, resolver.resolve(args.locomotion_summary) if args.locomotion_summary else None)
 
     unavailable = sorted(
         {
@@ -796,6 +903,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         audit_warnings.append("Compilation timing is missing for a referenced dataset; integration totals remain unavailable.")
     manifest = {
         "schema_version": 1,
+        "path_mappings": resolver.metadata(),
+        "deployment_inputs": deployment_inputs,
+        "deployment_size_definition": "Unique required on-disk loader files in MiB (2**20 bytes); router manifest/model/args plus feature preprocessing; explicitly supplied distilled exports. Existing specialist policies excluded. Training artifact_size_mb unchanged. Missing files make the deployment total unavailable.",
         "additive_timing_fields": list(STAGE_FIELDS),
         "compilation_s_is_subtotal": True,
         "accounting_boundary": {
