@@ -148,6 +148,64 @@ the selected Bayes and EMA baseline parameters.
 
 ## Frozen offline paper Experiments 1--2
 
+### Docker launcher (persistent shared outputs)
+
+From the repository root, use Bash (no TTY required). This reuses the
+`leggedgym-ex:isaacgym` image/venv and mounts source subdirectories, not the
+workspace containing `.venv`. Inputs are mounted read-only. Every invocation
+creates a **new** run; an existing `--run-id` is rejected to protect old results.
+
+```bash
+# Offline training/evaluation only; already-compiled datasets required.
+bash legged_gym/scripts/run_paper_experiments_docker.sh offline \
+  --classifier-data /data/compiled/structural --ordered-data /data/compiled/ordered \
+  --output-root /data/paper_runs --run-id offline_v1 --gpu 0
+
+# Locomotion using a completed offline run (no classifier retraining).
+bash legged_gym/scripts/run_paper_experiments_docker.sh locomotion \
+  --paper-offline-dir /data/paper_runs/offline_v1/offline \
+  --jit /models/specialists.pt --distilled-jit /models/distilled.pt \
+  --output-root /data/paper_runs --run-id locomotion_v1
+
+# Offline first, then headless locomotion using its new classifiers.
+bash legged_gym/scripts/run_paper_experiments_docker.sh all \
+  --classifier-data /data/compiled/structural --ordered-data /data/compiled/ordered \
+  --jit /models/specialists.pt --distilled-jit /models/distilled.pt \
+  --output-root /data/paper_runs --gpu 1
+
+# Regenerate PNG/PDFs from the self-contained bundle, without datasets/models.
+bash legged_gym/scripts/run_paper_experiments_docker.sh plot-only \
+  --bundle /data/paper_runs/offline_v1/offline/figure_data.pt \
+  --output-root /data/paper_runs --gpu none
+```
+
+Use `--image` to override the image, `--dry-run` to validate paths/show commands
+without creating outputs, and `--help` for all options. Separate passthrough uses
+one token per option, e.g. `--offline-arg --batch-size --offline-arg 128` or
+`--locomotion-arg --eval-seeds --locomotion-arg 101 --locomotion-arg 202`.
+Path/mode overrides must use the wrapper's options; no shell command strings
+are evaluated. Without passthrough, existing experimental defaults are unchanged.
+Host GPU indices are exposed as `cuda:0` inside the single-GPU container.
+
+All checkpoints, metrics, figures/bundle and replay data persist under
+`<output-root>/<run-id>/offline/` and `locomotion/`. Console/simulator logs live
+in `logs/`; `commands.sh`, `mounts.txt`, `run_metadata.txt`, `git_status.txt`, and
+per-stage/overall `exit_status` files record execution. Container paths are
+`/paper/offline`, `/paper/locomotion`, `/paper/logs` (also the workspace `logs/`).
+Mappings in `mounts.txt` resolve these paths to the host when moving artifacts.
+
+The launcher uses `umask 000` and normalizes only the **new managed run** to
+0777 directories / 0666 files on exit, including failure. Everyone can modify
+these results: use trusted storage with traversable ancestor directories.
+Existing results, inputs, repository permissions and the host environment are
+untouched. Host crashes/SIGKILL or inaccessible Docker may prevent final cleanup;
+cleanup failures are reported. A lightweight Docker-only write/failure check is
+available with `--smoke-test success` or `--smoke-test failure` (exit 23); combine
+with `plot-only --bundle <any-readable-file> --gpu none`. It never runs an
+experiment. Automated checks: `RUN_DOCKER_SMOKE=1 python -m unittest discover
+-s tests -p test_paper_experiments_docker.py` (uses local `ubuntu:20.04`, overridable
+with `PAPER_SMOKE_IMAGE`). No full sweep is needed to test the launcher.
+
 To train exactly three deterministic seeded copies of the fixed feature/raw-depth
 NNs and evaluate instantaneous, fixed EMA, and fixed persistent-Bayes results
 without running any search:
