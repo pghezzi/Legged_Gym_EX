@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.utils.depth_terrain_classifier.terrain_classifier_bayes_streaming_prototype_rbf import (
     BayesianTerrainFilter,
+    TRANSITION_ACCOUNTING_VERSION,
     NeuralClassifierAdapter,
     fit_nn,
     make_persistent_transition_matrix,
@@ -83,6 +84,16 @@ SCALAR_EXPERIMENT_2_METRICS = (
     "accuracy", "balanced_accuracy", "macro_f1", "transition_window_accuracy",
     "steady_state_accuracy", "mean_transition_delay", "false_transition_rate",
     "minimum_class_recall",
+)
+TRANSITION_V2_METRICS = (
+    "total_transitions_v2", "matched_transitions_v2", "missed_transitions_v2",
+    "transition_miss_rate_v2", "mean_matched_transition_delay_frames_v2",
+)
+TRANSITION_RECORD_FIELDS = (
+    "architecture", "temporal_method", "seed", "transition_metric_version",
+    "sequence_id", "sequence_start_frame", "transition_frame", "sequence_transition_frame",
+    "segment_end_frame_exclusive", "from_label", "target_label", "matched", "missed",
+    "matched_frame", "delay_classification_frames",
 )
 
 
@@ -145,6 +156,8 @@ def _aggregate(rows: Sequence[Mapping[str, Any]], group_keys: Sequence[str],
             finite = values[np.isfinite(values)]
             summary[f"{metric}_mean"] = float(finite.mean()) if finite.size else float("nan")
             summary[f"{metric}_std"] = float(finite.std(ddof=1)) if finite.size > 1 else 0.0
+            if metric in TRANSITION_V2_METRICS and finite.size < 2:
+                summary[f"{metric}_std"] = float("nan")
             summary[f"{metric}_raw"] = values.tolist()
         recall_values = {
             str(label): np.asarray([row["per_class_recall"][str(label)] for row in members])
@@ -161,6 +174,8 @@ def _aggregate(rows: Sequence[Mapping[str, Any]], group_keys: Sequence[str],
         summary["confusion_matrix_mean"] = matrices.mean(axis=0).tolist()
         summary["confusion_matrix_std"] = matrices.std(axis=0, ddof=1).tolist()
         summaries.append(summary)
+        if "total_transitions_v2" in scalar_metrics:
+            summary["transition_metric_version"] = TRANSITION_ACCOUNTING_VERSION
     return summaries
 
 
@@ -168,8 +183,9 @@ def _csv_value(value: Any) -> Any:
     return json.dumps(json_safe(value), sort_keys=True) if isinstance(value, (dict, list, tuple)) else value
 
 
-def _write_rows(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    fields = list(dict.fromkeys(key for row in rows for key in row))
+def _write_rows(path: Path, rows: Sequence[Mapping[str, Any]],
+                fields: Sequence[str] | None = None) -> None:
+    fields = list(fields) if fields is not None else list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
@@ -212,7 +228,8 @@ def _sequential_metrics(classifier: NeuralClassifierAdapter, logits: torch.Tenso
         bayes_filter, probabilities, sequence_ids=ids, return_traces=False)
 
     return {
-        name: evaluate_sequential_predictions(truth, predictions, classifier.class_ids, ids)
+        name: evaluate_sequential_predictions(truth, predictions, classifier.class_ids, ids,
+                                              transition_accounting_v2=True)
         for name, predictions in (("instantaneous", instantaneous), ("ema", ema), ("bayes", bayes))
     }
 
@@ -366,6 +383,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     feature_preprocessing_peak_mb = peak_memory_mb(device)
 
     experiment_1_rows, experiment_2_rows, training_records = [], [], []
+    transition_records = []
     raw_train = raw_validation = None
     for architecture in ("feature_nn", "raw_depth_nn"):
         config = FIXED_MODEL_CONFIGS[architecture]
@@ -541,10 +559,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 experiment_2_rows.append({
                     "architecture": architecture, "temporal_method": method,
                     "seed": seed, "model_path": str(model_path),
-                    **{key: metrics[key] for key in SCALAR_EXPERIMENT_2_METRICS},
+                    **{key: metrics[key] for key in SCALAR_EXPERIMENT_2_METRICS + TRANSITION_V2_METRICS},
+                    "transition_metric_version": TRANSITION_ACCOUNTING_VERSION,
                     "per_class_recall": metrics["per_class_recall"],
                     "confusion_matrix": json_safe(metrics["confusion_matrix"]),
                 })
+                transition_records.extend({
+                    "architecture": architecture, "temporal_method": method, "seed": seed,
+                    "transition_metric_version": TRANSITION_ACCOUNTING_VERSION, **record,
+                } for record in metrics["transition_records_v2"])
             classifier.to("cpu")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -553,7 +576,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         experiment_1_rows, ("architecture",), SCALAR_EXPERIMENT_1_METRICS, class_ids)
     experiment_2_summary = _aggregate(
         experiment_2_rows, ("architecture", "temporal_method"),
-        SCALAR_EXPERIMENT_2_METRICS, class_ids)
+        SCALAR_EXPERIMENT_2_METRICS + TRANSITION_V2_METRICS, class_ids)
     expected = 2 * len(MODEL_SEEDS)
     if len(experiment_1_rows) != expected or len(experiment_2_rows) != 3 * expected:
         raise AssertionError("unexpected number of architecture/seed/method results")
@@ -566,9 +589,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     save_results(output / "experiment_1_instantaneous_summary.json", experiment_1_summary)
     save_results(output / "experiment_2_sequential_per_seed.json", experiment_2_rows)
     save_results(output / "experiment_2_sequential_summary.json", experiment_2_summary)
+    _write_rows(output / "experiment_2_transitions_v2.csv", transition_records, TRANSITION_RECORD_FIELDS)
+    save_results(output / "experiment_2_transitions_v2.json", transition_records)
     _make_plots(output, experiment_1_summary, experiment_2_summary, class_ids)
 
     manifest = {
+        "transition_accounting": {
+            "version": TRANSITION_ACCOUNTING_VERSION,
+            "match_window": "[transition frame, target segment end), within sequence",
+            "delay_units": "classification frames", "unmatched_delay": "unavailable",
+            "legacy_mean_transition_delay_and_search_scoring": "unchanged",
+            "false_transition_definition": "unchanged",
+            "aggregation": "equal-weight seed mean/std; unavailable values excluded",
+        },
         "dataset_root": str(dataset_root), "structural_dataset": str(structural_dir),
         "ordered_dataset": str(ordered_dir),
         "structural_split_manifest": str(structural_dir / "split_manifest.json")
