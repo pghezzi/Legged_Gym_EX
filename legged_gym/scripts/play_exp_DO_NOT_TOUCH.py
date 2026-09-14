@@ -771,6 +771,8 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
 
     if args.save_depth_classifier_data:
         depth_images_log = []
+        from legged_gym.utils.dataset_provenance import CaptureProvenance
+        capture_provenance = CaptureProvenance(env.num_envs, env.device)
         base_rpy_log = []
         base_ang_vel_log = []
         resets_log = []
@@ -883,6 +885,15 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         collection_total_started = args._collection_total_started
         collection_started = time.perf_counter()
         collection_setup_s = collection_started - collection_total_started
+    if args.save_depth_classifier_data:
+        # Observe every actual reset, including manual resets AFTER a capture
+        # and simulator episode resets on intervening non-camera control ticks.
+        original_reset_idx = env.reset_idx
+        def tracked_reset_idx(env_ids):
+            result = original_reset_idx(env_ids)
+            capture_provenance.reset(env_ids)
+            return result
+        env.reset_idx = tracked_reset_idx
     #(10* 1000 * 100) / 5 = 2000
     for i in range(int(10.00*env.max_episode_length)):
         if not args.headless and args.follow_robot:
@@ -997,6 +1008,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
                     break
             if i % 5 == 0: # this assumes a 50hz policy so that we actually run at 10. If change, change this
                 if args.save_depth_classifier_data:
+                    capture_provenance.capture(i + 1)  # post-step observation
                     depth_images_log.append(env.depth_sensor_output.detach().cpu().clone())
                     base_rpy_log.append(env.simulator._base_euler.detach().cpu().clone())
                     base_ang_vel_log.append(env.simulator.base_ang_vel.detach().cpu().clone())
@@ -1062,7 +1074,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
                 env.reset_idx(env_ids)
 
         if i % 5 == 0 and args.save_depth_classifier_data and args.filter_depth_classifier_data:
-            resets_log.append(dones)
+            resets_log.append(dones.detach().cpu().clone())
 
         if args.save_depth_classifier_data:
             executed_control_steps += 1
@@ -1131,6 +1143,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
     if args.save_depth_classifier_data:
         synchronize(env.device)
         collection_wallclock_s = time.perf_counter() - collection_started
+        env.reset_idx = original_reset_idx
     if "depth_waq" in task_name and not args.no_depth_cam:
         cv2.destroyAllWindows()
     
@@ -1180,6 +1193,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
     
     if args.save_depth_classifier_data:
         preprocessing_timer = WallTimer(env.device).start()
+        observation_provenance = capture_provenance.export()
         print("compiling")
         depth_images_tensor = torch.stack(depth_images_log, dim=0).squeeze(2)
         del depth_images_log
@@ -1194,7 +1208,9 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             labels_tensor = None
         print("splitting")
         if args.filter_depth_classifier_data:
-            reset_tensor = torch.stack(resets_log, dim=0)
+            episodes = observation_provenance["episode_ids"]
+            reset_tensor = torch.zeros_like(episodes, dtype=torch.bool)
+            reset_tensor[1:] = episodes[1:] != episodes[:-1]
             print(depth_images_tensor.shape)
             depth_images_tensor = reset_split(depth_images_tensor, reset_tensor)   # [T, num_envs, H, W] (or however depth is shaped)
             print(depth_images_tensor.shape)
@@ -1202,6 +1218,9 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             base_ang_vel_tensor = reset_split(base_ang_vel_tensor, reset_tensor)
             if labels_tensor is not None:
                 labels_tensor = reset_split(labels_tensor, reset_tensor)
+            from legged_gym.utils.dataset_provenance import FRAME_FIELDS
+            for key in FRAME_FIELDS:
+                observation_provenance[key] = reset_split(observation_provenance[key], reset_tensor)
         if labels_tensor is not None:
             labels_tensor = tensor_to_keys(labels_tensor)
         if args.multitask:
@@ -1250,7 +1269,8 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             "base_ang_vel": base_ang_vel_tensor,
             "base_ang_vel_shape": tuple(base_ang_vel_tensor.shape),
             "terrain_name": labels_list,
-            "filtered": args.filter_depth_classifier_data
+            "filtered": args.filter_depth_classifier_data,
+            "provenance": observation_provenance,
         }, save_path)
 
         serialization_s = serialization_timer.stop()

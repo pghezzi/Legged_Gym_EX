@@ -3,15 +3,20 @@
 import torch
 
 from legged_gym.scripts.depth_data_pipeline.compile_depth_data import train_val_test_data
+from legged_gym.utils.dataset_provenance import CaptureProvenance
 
 
 def _write_raw(path, *, frames=4, envs=20, terrain_seeds=None):
+    tracker = CaptureProvenance(envs, "cpu")
+    for frame in range(frames):
+        tracker.capture(frame + 1)
     env_id = torch.arange(envs).view(1, envs, 1).expand(frames, envs, 1).clone()
     data = {
         "depth_images": env_id.view(frames, envs, 1, 1),
         "base_rpy": env_id.expand(frames, envs, 3).float(),
         "base_ang_vel": env_id.expand(frames, envs, 3).float(),
         "terrain_name": [[f"env_{env}" for env in range(envs)] for _ in range(frames)],
+        "provenance": tracker.export(),
     }
     if terrain_seeds is not None:
         data["terrain_seed"] = torch.as_tensor(terrain_seeds)

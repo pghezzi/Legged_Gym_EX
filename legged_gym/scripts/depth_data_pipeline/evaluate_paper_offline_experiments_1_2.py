@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
+from legged_gym.utils.dataset_provenance import validate_partitions
 from legged_gym.utils.depth_terrain_classifier.terrain_classifier_bayes_streaming_prototype_rbf import (
     BayesianTerrainFilter,
     TRANSITION_ACCOUNTING_VERSION,
@@ -321,6 +322,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--quiet-training", action="store_true")
+    parser.add_argument("--allow-legacy-provenance", action="store_true",
+                        help="Explicit unverified per_eps fallback for historical compiled datasets")
     args = parser.parse_args(argv)
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
@@ -361,7 +364,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         unknown = set(_labels(data["labels"])) - set(class_ids)
         if unknown:
             raise ValueError(f"{name} contains labels absent from training: {sorted(unknown, key=str)}")
-    ordered_ids = sequence_ids_for(ordered_test)
+    provenance_checks = validate_partitions(
+        {"train": train, "validation": validation, "structural_test": structural_test},
+        args.allow_legacy_provenance)
+    # Ordered test may legitimately equal structural test, but never train/val.
+    ordered_provenance_checks = validate_partitions(
+        {"train": train, "validation": validation, "ordered_test": ordered_test},
+        args.allow_legacy_provenance)
+    ordered_ids = sequence_ids_for(ordered_test, allow_legacy=args.allow_legacy_provenance)
 
     reset_peak_memory(device)
     feature_total_timer = WallTimer(device).start()
@@ -594,6 +604,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     _make_plots(output, experiment_1_summary, experiment_2_summary, class_ids)
 
     manifest = {
+        "provenance_checks": provenance_checks,
+        "ordered_provenance_checks": ordered_provenance_checks,
+        "legacy_provenance_fallback": args.allow_legacy_provenance,
         "transition_accounting": {
             "version": TRANSITION_ACCOUNTING_VERSION,
             "match_window": "[transition frame, target segment end), within sequence",
