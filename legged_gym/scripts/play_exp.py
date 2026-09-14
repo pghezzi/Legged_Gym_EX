@@ -191,12 +191,50 @@ def get_args():
     parser.add_argument('--save_depth_classifier_data', action='store_true', default=False, help="if with depth cam use to save depth image and rpy of all executed steps")
     parser.add_argument('--jit',            type=str, default='', help="path to a jit-scripted policy to load and swap with the trained policy (replaces JIT env var)")
     parser.add_argument('--curriculum', action='store_true', default=False, help="Load default curriculum")
+    parser.add_argument('--start_terrain_level', type=int, default=0,
+                        help="Starting terrain row (zero-based, default: 0). With --curriculum, "
+                             "difficulty is row / num_rows; selected terrain repeats the same geometry.")
     parser.add_argument('--test_terrain', type=str, default='random_uniform', help="current test_terrain")
     parser.add_argument('--no_depth_cam', action='store_true', default=False, help="disable test cam if available")
     parser.add_argument('--terrain_detector', type=str, default='', help="test a terrain detector")
     parser.add_argument('--command_test_suite', action='store_true', default=False, help="run a simple commnad test suite")
     
     return configure_runtime_device(parser.parse_args())
+
+def configure_start_terrain_level(terrain_cfg, level):
+    """Validate against the final play layout before constructing the simulator."""
+    if terrain_cfg.mesh_type not in ("heightfield", "trimesh"):
+        if level != 0:
+            raise ValueError("--start_terrain_level requires heightfield or trimesh terrain")
+        return
+    if not 0 <= level < terrain_cfg.num_rows:
+        raise ValueError(f"--start_terrain_level must be between 0 and {terrain_cfg.num_rows - 1} "
+                         f"for this terrain layout (got {level})")
+    # The simulator samples [0, max_init_level] during construction. Keep that
+    # sample valid; reset_start_terrain_level places every robot on the exact row.
+    terrain_cfg.max_init_terrain_level = level
+
+
+def reset_start_terrain_level(env, level):
+    """Place robots on the requested row, retaining their terrain-type columns."""
+    terrain_cfg = env.cfg.terrain
+    configure_start_terrain_level(terrain_cfg, level)
+    if terrain_cfg.mesh_type in ("heightfield", "trimesh"):
+        sim = env.simulator
+        sim.terrain_levels[:] = level
+        sim.env_origins[:] = sim._terrain_origins[sim.terrain_levels, sim.terrain_types]
+        detail = (f"difficulty {level / terrain_cfg.num_rows:.3f}" if terrain_cfg.curriculum
+                  else "row selection only; terrain curriculum is disabled")
+        print(f"Starting terrain row {level}/{terrain_cfg.num_rows - 1} ({detail}).")
+    # Reset refreshes observations/history. Suppress curriculum changes for this
+    # placement only, so it cannot immediately promote/demote the requested row.
+    curriculum = terrain_cfg.curriculum
+    terrain_cfg.curriculum = False
+    try:
+        env.reset()
+    finally:
+        terrain_cfg.curriculum = curriculum
+
 
 def override_configs(env_cfg, args):
     """Override some environment configuration parameters for testing
@@ -283,8 +321,13 @@ def override_configs(env_cfg, args):
     #env_cfg.terrain.vertical_scale = 0.1
     if args.curriculum:
         env_cfg.terrain.num_cols = sum(1 for x in env_cfg.terrain.terrain_proportions if x > 0)
+        if env_cfg.terrain.num_cols == 0:
+            raise ValueError("--curriculum requires at least one nonzero terrain proportion")
         env_cfg.terrain.num_rows = 10 // env_cfg.terrain.num_cols
         env_cfg.terrain.border_size = 5.0
+        env_cfg.terrain.curriculum = True
+        env_cfg.terrain.selected = False
+        env_cfg.terrain.custom_selected = False
     elif env_cfg.terrain.mesh_type in ["heightfield", "trimesh"]:
         env_cfg.terrain.num_rows = 10
         env_cfg.terrain.num_cols = 1
@@ -355,7 +398,7 @@ def override_configs(env_cfg, args):
             env_cfg.viewer.pos[i] = env_cfg.viewer.pos[i] - env_cfg.terrain.plane_length / 4
             env_cfg.viewer.lookat[i] = env_cfg.viewer.lookat[i] - env_cfg.terrain.plane_length / 4    
         
-    env_cfg.terrain.max_init_terrain_level = env_cfg.terrain.num_rows - 1
+    configure_start_terrain_level(env_cfg.terrain, args.start_terrain_level)
     if args.use_joystick:
         env_cfg.commands.heading_command = False
     
@@ -477,26 +520,32 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         iter_count = 4.0
 
     for i in range(int(iter_count*env.max_episode_length)):
-        if args.command_test_suite:
-            current = i // env.max_episode_length
-            if i % env.max_episode_length == 0:
-                name = test_names[current]
-                cmd = command_tests[name]
-                print(f"Running test {name}, {cmd}")
-            env.commands[:, 0] = cmd["vx"]
-            env.commands[:, 1] = cmd["vy"]
-            env.commands[:, 2] = cmd["wz"]
-            env.commands[:, 3] = cmd["heading"]
-        elif args.use_joystick:
-            joystick.update()
-            env.commands[:, 0] = -joystick.ly
-            env.commands[:, 1] = -joystick.lx
-            env.commands[:, 2] = -joystick.rx
-        elif i % env.max_episode_length == 0:
-            env._resample_commands(torch.arange(env.num_envs))
+        # if args.command_test_suite:
+        #     current = i // env.max_episode_length
+        #     if i % env.max_episode_length == 0:
+        #         name = test_names[current]
+        #         cmd = command_tests[name]
+        #         print(f"Running test {name}, {cmd}")
+        #     env.commands[:, 0] = cmd["vx"]
+        #     env.commands[:, 1] = cmd["vy"]
+        #     env.commands[:, 2] = cmd["wz"]
+        #     env.commands[:, 3] = cmd["heading"]
+        # elif args.use_joystick:
+        #     joystick.update()
+        #     env.commands[:, 0] = -joystick.ly
+        #     env.commands[:, 1] = -joystick.lx
+        #     env.commands[:, 2] = -joystick.rx
+        # elif i % env.max_episode_length == 0:
+        #     env._resample_commands(torch.arange(env.num_envs))
 
-        if args.save_depth_classifier_data:
-            pass
+        # if args.save_depth_classifier_data:
+        #     pass
+
+        cmd = command_tests["forward"]
+        env.commands[:, 0] = cmd["vx"]
+        env.commands[:, 1] = cmd["vy"]
+        env.commands[:, 2] = cmd["wz"]
+        env.commands[:, 3] = cmd["heading"]
 
         
         if args.jit and i == env.max_episode_length:
@@ -680,13 +729,12 @@ def play(args):
 
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
-    #randomly divides robots
-    env.simulator._terrain_levels[:] = env.simulator._max_terrain_level + 1
-    env.reset_idx(torch.arange(env.num_envs))
     # load policy
     train_cfg.runner.resume = True
 
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
+    # Runners may reset during construction, so choose the starting slice last.
+    reset_start_terrain_level(env, args.start_terrain_level)
 
     policy = ppo_runner.get_inference_policy(device=env.device)
     policy1 = None

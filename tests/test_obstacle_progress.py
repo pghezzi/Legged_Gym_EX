@@ -282,6 +282,7 @@ def test_integration_calls_existing_rewards_then_unscaled_bonus_before_reset():
     namespace = {"Base": Base}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[replacement], type_ignores=[])), str(path), "exec"), namespace)
     obj = namespace["Subject"]()
+    obj._update_feet_air_time = lambda: None
     obj.obstacle_progress = SimpleNamespace(advance=lambda failed: (torch.tensor([.2]), torch.tensor([.3])),
                                            state=SimpleNamespace(stationary_penalty=torch.tensor([-.1])))
     obj.gap_reset_buf = torch.tensor([False])

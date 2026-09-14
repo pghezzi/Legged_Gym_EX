@@ -36,10 +36,10 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         class termination():
             reset_unrecoverable_gaps = True
             gap_terrain_depth_threshold = 1.0
-            gap_foot_drop_threshold = 0.25
-            gap_base_drop_threshold = 0.30
+            gap_foot_drop_threshold = 0.10
+            gap_base_drop_threshold = 0.20
             gap_min_fallen_feet = 1
-            gap_reset_steps = 4
+            gap_reset_steps = 2
     #else:
     #    class termination():
     #        reset_unrecoverable_gaps = False
@@ -104,6 +104,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         }
         terrain_curriculum_difficulty.update(terrain_curriculum_difficulty_custom)
         terrain_proportions = terrain_list
+        max_init_terrain_level = 5 # starting curriculum level
         #terrain_proportions = [0] * 11
         #terrain_proportions[10] = 1
         
@@ -143,13 +144,16 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                           30.1, 30.1, 15.7, 
                           30.1, 30.1, 15.7]
     class rewards( Go2RoughCommonCfg.rewards ):
+        feet_air_time_target = 0.25  # s; shorter swings retain the existing penalty
+        feet_air_time_max = 0.50  # s; longer swings earn no touchdown reward
+
         class obstacle_progress:
             # Opt-in, dedicated IsaacGym simplified GAP/PIT/STAIRS only.
             enabled = True
             # [k_progress (reward/metre), b0 (reward), b1 (reward/unit difficulty)]
-            gap = [1.00, 0.40, 0.667]
-            pit = [1.00, 0.40, 0.667]
-            stairs = [1.00, 0.40, 0.667]
+            gap = [0.40, 0.20, 0.5]
+            pit = [0.40, 0.20, 0.5]
+            stairs = [0.40, 0.20, 0.5]
             activation_distance = 1.0  # m before first edge/riser
             base_clearance = 0.35  # m beyond final edge for base/root
             foot_clearance = 0.05  # m beyond final edge for ALL feet
@@ -161,7 +165,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
             stationary_speed = 0.05  # m/s, stationary threshold
             stationary_radius = 1.0  # m from crossing path (penalty), final edge (time log)
             stationary_penalty_rate = 0.05  # reward/s deducted; 0 disables penalty
-            stationary_grace_s = 0.50  # continuous stationary time before charging
+            stationary_grace_s = 0.10  # continuous stationary time before charging
 
         use_reward_curriculum = False
 
@@ -187,17 +191,19 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         foot_clearance_target = 0.08 # desired foot clearance above ground [m]
         foot_height_offset = 0.022   # height of the foot coordinate origin above ground [m]
         foot_clearance_tracking_sigma = 0.01
+        foot_clearance_min_swing_speed = 0.05  # m/s XY; terrain-aware reward needs a moving swing foot
         soft_torque_limit = 0.9
         base_up_pit_sigma = 0.01
         tracking_sigma = 0.2
         corner_proximity_sigma = 0.01
-        only_positive_rewards = False
+        only_positive_rewards = True
         feet_edge_threshold = 0.05 # distance threshold below which foot is considered to be near the edge of a terrain
         class scales:
+            feet_prolonged_air_time = -0.2  # reward/s per overdue foot, before clipping; 0 disables
             base_height = -1.0
             #torque_limits = -0.001
             torque_limits = -0.1
-            dof_vel_limits = -0.001
+            dof_vel_limits = -0.01
             dof_vel = -0.0001
             if terrain_name in ("baseline"):
                 torque_limits = -0.01
@@ -223,17 +229,17 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
             elif terrain_name in ("gap", "stairs", "all_stairs"):
                 dof_pos_limits = -2.0
                 collision = -2.0
-                tracking_lin_vel = 3.0
+                tracking_lin_vel = 2.0
                 tracking_ang_vel = 1.0
                 lin_vel_z = -0.1
                 ang_vel_xy = -0.05
-                orientation = -0.1
+                orientation = -1.0
                 dof_power = -2e-05
                 dof_acc = -2e-07
-                action_rate = -0.01
-                action_smoothness = -0.01
+                action_rate = -0.001
+                action_smoothness = -0.001
                 hip_pos = -0.15
-                foot_clearance = 0.7
+                foot_clearance_terrain_aware = 0.7
                 feet_stumble = -1.0
                 #feet_contact_stand_still = 0.1
                 feet_near_edge = -1.0
@@ -241,8 +247,8 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
             elif terrain_name in ("pit", "center_platform", "all_pit"):
                 dof_pos_limits = -2.0
                 collision = -2.0
-                tracking_lin_vel = 3.0
-                tracking_ang_vel =  0.7
+                tracking_lin_vel = 1.5
+                tracking_ang_vel =  1.0
                 lin_vel_z = -0.1
                 ang_vel_xy = -0.05
                 orientation = -0.1
@@ -250,8 +256,10 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                 dof_acc = -2e-08
                 action_rate = -0.001
                 action_smoothness = -0.001
-                hip_pos = -0.015
-                foot_clearance = 0.7
+                hip_pos = -0.0
+                front_hip_pos = 0.015
+                rear_hip_pos = -0.02
+                foot_clearance = 0.3
                 feet_stumble = -1.0
                 #feet_contact_stand_still = 0.1
                 feet_near_edge = -1.0
@@ -424,6 +432,10 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
     class algorithm( LeggedRobotDreamwaqCfgPPO.algorithm ):
         if terrain_name == "pit":
             entropy_coef = 0.005
+        elif terrain_name == "all_stairs":
+            entropy_coef = 0.005
+        elif terrain_name == "gap":
+            entropy_coef = 0.005
         encoder_lr = 2.e-4
         num_encoder_epochs = 1
         vae_kld_weight = 2.0
@@ -478,9 +490,18 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
 # python -m legged_gym.scripts.train --task go2_depth_waq --headless
 
 # export DEPTHWAQ_RESUME_UNTIL=50000
-# export TERRAIN=gap
 # export PARKOUR_AUX=1
-# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep11_00-49-09_dreamwaq_isaacgym/model_16000.pt
+# export SIMULATOR=isaacgym
+# export TERRAIN=gap
+# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep11_00-49-09_dreamwaq_isaacgym/model_15000.pt
+
+# python -m legged_gym.scripts.train --task go2_depth_waq --headless
+
+
+# export DEPTHWAQ_RESUME_UNTIL=50000
+# export TERRAIN=gap
+# export PARKOUR_AUX=0
+# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep11_22-11-26_dreamwaq_isaacgym/model_40000.pt
 
 # python -m legged_gym.scripts.train --task go2_depth_waq --headless
 
@@ -489,21 +510,23 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
 # NEW Resume logic!
 # export DEPTHWAQ_RESUME_UNTIL=65000
 # export TERRAIN=pit
+# export SIMULATOR=isaacgym
 # export PARKOUR_AUX=1
-# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_pit/Sep11_01-24-38_dreamwaq_isaacgym/model_18000.pt
+# export FINETUNE=/workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_pit/Sep11_01-24-38_dreamwaq_isaacgym/model_20000.pt
 
 # python -m legged_gym.scripts.train --task go2_depth_waq --headless
 
 
-# export TERRAIN=gap
+# export TERRAIN=pit
 # export PARKOUR_AUX=0
-# unset DEPTHWAQ_RESUME_UNTIL FINETUNE
+# export FINETUNE=1
+# unset DEPTHWAQ_RESUME_UNTIL
 
 # python -m legged_gym.scripts.play_exp \
 #   --task go2_depth_waq \
-#   --load_run /workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_gap/Sep10_18-42-26_dreamwaq_isaacgym \
-#   --ckpt -1 \
+#   --load_run /workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_pit/Sep11_22-12-25_dreamwaq_isaacgym \
+#   --ckpt 50000 \
 #   --num_envs 1 \
 #   --curriculum \
-#   --test_terrain gap \
+#   --test_terrain pit \
 #   --follow_robot
