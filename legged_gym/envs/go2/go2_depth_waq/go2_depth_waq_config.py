@@ -36,10 +36,10 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         class termination():
             reset_unrecoverable_gaps = True
             gap_terrain_depth_threshold = 1.0
-            gap_foot_drop_threshold = 0.10
-            gap_base_drop_threshold = 0.20
+            gap_foot_drop_threshold = 0.25
+            gap_base_drop_threshold = 0.30
             gap_min_fallen_feet = 1
-            gap_reset_steps = 2
+            gap_reset_steps = 4
     #else:
     #    class termination():
     #        reset_unrecoverable_gaps = False

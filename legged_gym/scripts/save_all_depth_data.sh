@@ -34,7 +34,7 @@ python -m legged_gym.scripts.play_exp_DO_NOT_TOUCH \
 --multitask \
 "${MULTITASK_CKPTS[@]}"
 
-# ---- Run 2: multiterrain over seeds (42 69 100) ----
+# ---- Run 2: multiterrain over seeds (42 69 100), viewer enabled ----
 SEEDS=(42 69 100)
 for seed in "${SEEDS[@]}"; do
     python -m legged_gym.scripts.play_exp_DO_NOT_TOUCH \
@@ -43,8 +43,8 @@ for seed in "${SEEDS[@]}"; do
     --hard_terrain_detector \
     --save_depth_classifier_data \
     --multiterrain \
-    --headless \
     --num_envs 100 \
+    --headless \
     --multitask \
     "${MULTITASK_CKPTS[@]}" \
     --seed "$seed"

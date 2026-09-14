@@ -13,7 +13,6 @@ from legged_gym.utils.exp_data_logger import ExpLogger
 from legged_gym.utils.terrain_vars import TERRAIN_INDEX, TERRAIN_KEYS
 import argparse
 
-import cv2
 
 from rsl_rl.utils.training_cost import (
     artifact_size_mb,
@@ -733,6 +732,8 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         policy : a policy that takes observations and outputs actions
         args: command line arguments
     """
+    if not args.no_depth_cam:
+        import cv2  # Optional: headless depth collection does not need a preview window.
     
     robot_index = 0 # which robot is used for logging
     joint_index = 2 # which joint is used for logging
@@ -1066,6 +1067,14 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         if args.save_depth_classifier_data:
             executed_control_steps += 1
             completed_episodes += torch.count_nonzero(dones)
+            if executed_control_steps % 10_000 == 0:
+                print(
+                    f"[Collection] {executed_control_steps:,}/"
+                    f"{int(10.00 * env.max_episode_length):,} control timesteps collected "
+                    f"per environment; {collected_depth_samples:,} depth samples buffered "
+                    f"across {env.num_envs} environments. Saving begins after the run finishes.",
+                    flush=True,
+                )
 
         #if dones[0] == True:
         #    if args.terrain_detector:
