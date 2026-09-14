@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Resolve paths from this checkout, including when launched inside Docker.
+collection_repo=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$collection_repo"
+
 # Set simulator
 export SIMULATOR=isaacgym
 
 # ---- Checkpoint variables ----
-BASELINE_CKPT=/home/pablo/Documents/Legged_Gym_EX/logs/go2_depth_waq_baseline/Aug09_02-33-11_dreamwaq_isaacgym/model_7000.pt
-GAP_CKPT=/home/pablo/Documents/Legged_Gym_EX/logs/go2_depth_waq_fft_gap/Aug12_17-01-51_dreamwaq_isaacgym/model_47000.pt
-STAIRS_CKPT=/home/pablo/Documents/Legged_Gym_EX/logs/go2_depth_waq_fft_all_stairs/Aug14_14-23-53_dreamwaq_isaacgym/model_47000.pt
-PIT_CKPT=/home/pablo/Documents/Legged_Gym_EX/logs/go2_depth_waq_fft_pit/Aug29_00-30-31_dreamwaq_isaacgym/model_67000.pt
+# Match Go2DepthWaqDistillCfg.distillation.teachers.
+BASELINE_CKPT="$collection_repo/logs/go2_depth_waq_baseline/Sep09_05-49-24_dreamwaq_isaacgym/model_10000.pt"
+GAP_CKPT="$collection_repo/logs/go2_depth_waq_fft_gap/Sep13_19-33-31_dreamwaq_isaacgym/model_50000.pt"
+STAIRS_CKPT="$collection_repo/logs/go2_depth_waq_fft_all_stairs/Sep11_22-48-38_dreamwaq_isaacgym/model_50000.pt"
+PIT_CKPT="$collection_repo/logs/go2_depth_waq_fft_pit/Sep13_20-20-37_dreamwaq_isaacgym/model_54500.pt"
 
 MULTITASK_CKPTS=("$BASELINE_CKPT" "$GAP_CKPT" "$STAIRS_CKPT" "$PIT_CKPT")
 

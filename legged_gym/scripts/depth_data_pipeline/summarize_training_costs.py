@@ -18,19 +18,21 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import torch
 
-from rsl_rl.utils.training_cost import artifact_size_mb, write_cost_record
+from rsl_rl.utils.training_cost import STAGE_FIELDS, artifact_size_mb, write_cost_record
 
 
 METHODS = ("Feature Router", "Raw-Depth Router", "Distilled Policy")
 CORE_FIELDS = (
     "data_env_steps", "additional_locomotion_policy_env_steps",
     "total_post_specialist_env_steps", "data_generation_s", "preprocessing_s",
-    "optimization_s", "total_wallclock_s", "gpu_hours", "peak_gpu_memory_mb",
+    "optimization_s", "setup_s", "artifact_serialization_s", "overhead_s", "compilation_s",
+    "total_wallclock_s", "gpu_hours", "peak_gpu_memory_mb",
     "trainable_params", "training_samples", "artifact_size_mb",
 )
 TABLE_FIELDS = (
     "data_env_steps", "additional_locomotion_policy_env_steps",
-    "total_post_specialist_env_steps", "data_generation_s", "optimization_s",
+    "total_post_specialist_env_steps", "setup_s", "data_generation_s", "preprocessing_s",
+    "optimization_s", "artifact_serialization_s", "overhead_s", "compilation_s",
     "total_wallclock_s", "gpu_hours", "peak_gpu_memory_mb", "trainable_params",
 )
 
@@ -60,7 +62,8 @@ def _sum(records: Sequence[Mapping[str, Any]], key: str) -> tuple[float | int | 
     values = [record.get(key) for record in records]
     if any(value is None for value in values):
         return None, "unavailable"
-    return sum(values), _combine_status(_status(record, key) for record in records)
+    status = _combine_status(_status(record, key) for record in records)
+    return (None, status) if status == "unavailable" else (sum(values), status)
 
 
 def _find_sidecars(paths: Sequence[Path], suffix: str) -> list[Path]:
@@ -355,77 +358,113 @@ def _distillation_records(paths: Sequence[Path]) -> list[dict[str, Any]]:
     return results
 
 
-def _compose_router_run(
-    classifier: Mapping[str, Any],
-    collection: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
+def _preparation_records(offline_dir: Path, explicit: Sequence[Path], dataset=None):
+    """Walk only training-dataset provenance; deduplicate artifacts, not filenames.
+
+    Missing known inputs get placeholder records so partial discovery cannot be
+    mistaken for a complete (or free) integration pipeline.
+    """
+    manifest = _load(offline_dir / "manifest.json")
+    def resolve(value, owner):
+        path = Path(value).expanduser()
+        return (path if path.is_absolute() else owner / path).resolve()
+    indexed = {}
+    for sidecar in _find_sidecars(explicit, "training_cost.json"):
+        record = _load(sidecar)
+        if record.get("run_type") in ("classifier_data_collection", "dataset_compilation"):
+            if record.get("dataset_path"):
+                indexed[resolve(record["dataset_path"], sidecar.parent)] = (record, sidecar)
+    root = dataset or manifest.get("structural_dataset")
+    split_ref = manifest.get("structural_split_manifest")
+    if root is None and split_ref:
+        root = str(resolve(split_ref, offline_dir).parent)
+    results, seen = [], set()
+    def visit(path, compiled=False):
+        path = path.resolve()
+        if path in seen:
+            return
+        seen.add(path)
+        sidecar = path / "training_cost.json" if compiled else Path(str(path) + ".training_cost.json")
+        record, sidecar = indexed.get(path, (None, sidecar))
+        expected = "dataset_compilation" if compiled else "classifier_data_collection"
+        if record is None and sidecar.is_file():
+            candidate = _load(sidecar)
+            if candidate.get("run_type") == expected:
+                record = candidate
+        result = dict(record) if record else {"run_type": expected, "dataset_path": str(path)}
+        result["cost_sidecar"] = str(sidecar)
+        results.append(result)
+        if not compiled:
+            return
+        split_path = path / "split_manifest.json"
+        if split_ref and path == resolve(root, offline_dir):
+            split_path = resolve(split_ref, offline_dir)
+        split = _load(split_path) if split_path.is_file() else {}
+        sources = (record or {}).get("source_files") or split.get("source_files") or split.get("sources", [])
+        sources = [item.get("source_file") if isinstance(item, dict) else item for item in sources]
+        calibration = split.get("calibration_source_file")
+        if calibration:
+            sources = [*sources, calibration]
+        if not sources:
+            results.append({"run_type": "classifier_data_collection", "dataset_path": None})
+        for source in sources:
+            if source:
+                source_path = resolve(source, split_path.parent)
+                # Also support compiled inputs in chained dataset pipelines.
+                is_compiled = source_path.is_dir() or indexed.get(source_path, ({},))[0].get("run_type") == "dataset_compilation"
+                visit(source_path, compiled=is_compiled)
+    if root:
+        visit(resolve(root, offline_dir), compiled=True)
+    else:
+        # Explicit historical records can recover costs, but compilation remains unknown.
+        results = [dict(record, cost_sidecar=str(sidecar)) for record, sidecar in indexed.values()]
+        if not any(r.get("run_type") == "dataset_compilation" for r in results):
+            results.append({"run_type": "dataset_compilation", "dataset_path": None})
+        if not any(r.get("run_type") == "classifier_data_collection" for r in results):
+            results.append({"run_type": "classifier_data_collection", "dataset_path": None})
+    return results
+
+
+def _compose_router_run(classifier: Mapping[str, Any],
+                        preparation: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     result = dict(classifier)
     statuses = dict(classifier.get("metric_status", {}))
-    for key in ("data_env_steps", "data_generation_s"):
-        value, state = _sum(collection, key)
-        result[key], statuses[key] = value, state
+    # A caller may discover the same source through calibration and training.
+    unique = {}
+    for record in preparation:
+        identity = (record.get("run_type"), record.get("dataset_path"))
+        unique.setdefault(identity, record)
+    preparation = list(unique.values())
+    collection = [r for r in preparation if r.get("run_type") == "classifier_data_collection"]
+    compilation = [r for r in preparation if r.get("run_type") == "dataset_compilation"]
+    components = [*preparation, classifier]
+    for key in STAGE_FIELDS:
+        if key == "preprocessing_s" and any(
+                r.get("timing_schema_version", 1) < 2 for r in collection):
+            # Legacy collection's hard-coded zero was not a measurement.
+            result[key], statuses[key] = None, "unavailable"
+        else:
+            result[key], statuses[key] = _sum(components, key)
+    for key in ("total_wallclock_s", "gpu_hours"):
+        # Old sidecars had shorter, incompatible boundaries. Keep their source
+        # values intact, but do not present them as complete integration totals.
+        if not collection or not compilation or any(r.get("timing_schema_version", 1) < 2 for r in components):
+            result[key], statuses[key] = None, "unavailable"
+        else:
+            result[key], statuses[key] = _sum(components, key)
+    result["compilation_s"], statuses["compilation_s"] = _sum(compilation, "total_wallclock_s")
+    result["data_env_steps"], statuses["data_env_steps"] = _sum(collection, "data_env_steps")
     result["additional_locomotion_policy_env_steps"] = 0
     statuses["additional_locomotion_policy_env_steps"] = "measured"
     result["total_post_specialist_env_steps"] = result["data_env_steps"]
     statuses["total_post_specialist_env_steps"] = statuses["data_env_steps"]
-    collection_total, collection_total_status = _sum(
-        collection, "total_wallclock_s"
-    )
-    preprocessing = result.get("preprocessing_s")
-    optimization = result.get("optimization_s")
-    serialization = result.get("artifact_serialization_s")
-    result["total_wallclock_s"] = (
-        collection_total + preprocessing + optimization + serialization
-        if all(
-            value is not None
-            for value in (
-                collection_total, preprocessing, optimization, serialization
-            )
-        )
-        else None
-    )
-    statuses["total_wallclock_s"] = _combine_status(
-        (
-            collection_total_status,
-            statuses.get(
-                "preprocessing_s", _status(classifier, "preprocessing_s")
-            ),
-            statuses.get(
-                "optimization_s", _status(classifier, "optimization_s")
-            ),
-            statuses.get(
-                "artifact_serialization_s",
-                _status(classifier, "artifact_serialization_s"),
-            ),
-        )
-    )
-    collection_gpu, collection_gpu_status = _sum(collection, "gpu_hours")
-    classifier_gpu = classifier.get("gpu_hours")
-    result["gpu_hours"] = (
-        collection_gpu + classifier_gpu
-        if collection_gpu is not None and classifier_gpu is not None
-        else None
-    )
-    statuses["gpu_hours"] = _combine_status(
-        (collection_gpu_status, _status(classifier, "gpu_hours"))
-    )
-    collection_peaks = [
-        record.get("peak_gpu_memory_mb") for record in collection
-    ]
-    peaks = [
-        value
-        for value in [*collection_peaks, classifier.get("peak_gpu_memory_mb")]
-        if value is not None
-    ]
-    result["peak_gpu_memory_mb"] = max(peaks) if peaks else None
+    peaks = [r.get("peak_gpu_memory_mb") for r in components if r.get("gpu_count") != 0]
+    result["peak_gpu_memory_mb"] = max(peaks) if peaks and all(v is not None for v in peaks) else None
     statuses["peak_gpu_memory_mb"] = _combine_status(
-        [_status(record, "peak_gpu_memory_mb") for record in collection]
-        + [_status(classifier, "peak_gpu_memory_mb")]
-    )
+        _status(r, "peak_gpu_memory_mb") for r in components if r.get("gpu_count") != 0)
     result["metric_status"] = statuses
-    result["collection_run_ids"] = [
-        record.get("dataset_path") for record in collection
-    ]
+    result["collection_run_ids"] = [r.get("dataset_path") for r in collection]
+    result["compilation_run_ids"] = [r.get("dataset_path") for r in compilation]
     return result
 
 
@@ -480,6 +519,8 @@ def _aggregate(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                 ],
                 dtype=float,
             )
+            if values.size != len(members):
+                values = np.asarray([], dtype=float)
             row[f"{key}_mean"] = float(values.mean()) if values.size else None
             row[f"{key}_std"] = (
                 float(values.std(ddof=1))
@@ -545,6 +586,11 @@ def _write_table(output: Path, summary: Sequence[Mapping[str, Any]]) -> None:
         "additional_locomotion_policy_env_steps": "Additional policy steps",
         "total_post_specialist_env_steps": "Total steps",
         "data_generation_s": "Data time (s)",
+        "setup_s": "Setup/load (s)",
+        "preprocessing_s": "Preprocessing (s)",
+        "artifact_serialization_s": "Serialization (s)",
+        "overhead_s": "Overhead (s)",
+        "compilation_s": "Compilation subtotal (s)",
         "optimization_s": "Optimization (s)",
         "total_wallclock_s": "Wall-clock (s)",
         "gpu_hours": "GPU-hours",
@@ -622,17 +668,18 @@ def _plots(
     save(fig, "training_cost_wallclock_gpu_hours")
 
     fig, ax = plt.subplots(figsize=(7, 4))
-    generation = np.asarray(
-        [plot_value(row, "data_generation_s_mean") for row in summary]
-    )
-    optimization = np.asarray(
-        [plot_value(row, "optimization_s_mean") for row in summary]
-    )
-    ax.bar(labels, generation, label="Data generation", color="#9ecae1")
-    ax.bar(
-        labels, optimization, bottom=generation,
-        label="Optimization", color="#3182bd",
-    )
+    bottom = np.zeros(len(summary))
+    complete = np.asarray([all(row.get(f"{key}_mean") is not None for key in STAGE_FIELDS)
+                           for row in summary])
+    for key, label in zip(STAGE_FIELDS, ("Setup/loading", "Data generation", "Preprocessing",
+                                        "Optimization", "Serialization", "Other overhead")):
+        values = np.asarray([plot_value(row, f"{key}_mean") for row in summary])
+        values = np.where(complete, values, np.nan)
+        ax.bar(labels, values, bottom=bottom, label=label)
+        bottom += values
+    for index, available in enumerate(complete):
+        if not available:
+            ax.text(index, 0, "unavailable", rotation=90, ha="center", va="bottom")
     ax.set_ylabel("Time (s)")
     ax.tick_params(axis="x", rotation=15)
     ax.legend(frameon=False)
@@ -678,6 +725,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--paper-offline-dir", type=Path, required=True)
     parser.add_argument("--collection-cost", type=Path, nargs="*", default=[])
+    parser.add_argument("--compilation-cost", type=Path, nargs="*", default=[])
     parser.add_argument("--distillation-run", type=Path, nargs="*", default=[])
     parser.add_argument(
         "--output", type=Path, default=Path("training_cost_audit")
@@ -691,20 +739,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     offline_dir = args.paper_offline_dir.expanduser().resolve()
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    collection_paths = _collection_paths(offline_dir, args.collection_cost)
-    collection_records = [
-        record for record in (_load(path) for path in collection_paths)
-        if record.get("run_type") == "classifier_data_collection"
-    ]
     classifier_components = _classifier_records(offline_dir)
-    router_records = [
-        _compose_router_run(record, collection_records)
-        for record in classifier_components
-    ]
+    router_records, preparation_records = [], []
+    for record in classifier_components:
+        preparation = _preparation_records(offline_dir,
+            [*args.collection_cost, *args.compilation_cost], record.get("structural_dataset"))
+        preparation_records.extend(preparation)
+        router_records.append(_compose_router_run(record, preparation))
+    collection_paths = sorted({Path(r["cost_sidecar"]) for r in preparation_records
+                               if r.get("run_type") == "classifier_data_collection" and r.get("cost_sidecar")})
+    compilation_paths = sorted({Path(r["cost_sidecar"]) for r in preparation_records
+                                if r.get("run_type") == "dataset_compilation" and r.get("cost_sidecar")})
+    collection_records = [r for r in preparation_records if r.get("run_type") == "classifier_data_collection"]
     distillation_inputs = list(args.distillation_run)
     if not distillation_inputs and (Path.cwd() / "logs").is_dir():
         distillation_inputs = [Path.cwd() / "logs"]
     distillation_records = _distillation_records(distillation_inputs)
+    for record in distillation_records:
+        record["compilation_s"] = 0.0  # Online rollout storage; no offline dataset compilation.
+        record.setdefault("metric_status", {})["compilation_s"] = "measured"
     per_run = [*router_records, *distillation_records]
     summary = _aggregate(per_run)
     _write_csv(output / "training_cost_per_run.csv", per_run)
@@ -734,12 +787,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         audit_warnings.append(
             f"Expected 3 distillation seeds when supplied, found {counts['Distilled Policy']}."
         )
-    if not collection_records:
+    if not any(record.get("total_wallclock_s") is not None for record in collection_records):
         audit_warnings.append(
             "No collection sidecar was found; router collection costs remain unavailable."
         )
+    if any(record.get("total_wallclock_s") is None for record in preparation_records
+           if record.get("run_type") == "dataset_compilation"):
+        audit_warnings.append("Compilation timing is missing for a referenced dataset; integration totals remain unavailable.")
     manifest = {
         "schema_version": 1,
+        "additive_timing_fields": list(STAGE_FIELDS),
+        "compilation_s_is_subtotal": True,
         "accounting_boundary": {
             "start": "specialist locomotion policies already trained and frozen",
             "end": (
@@ -749,12 +807,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         },
         "counted_stages": {
             "Feature Router": [
-                "shared classifier rollout collection",
+                "shared classifier rollout collection and dataset compilation",
                 "feature generation/standardization",
                 "feature-NN optimization",
             ],
             "Raw-Depth Router": [
-                "shared classifier rollout collection",
+                "shared classifier rollout collection and dataset compilation",
                 "raw-depth/state packing",
                 "raw-depth-NN optimization",
             ],
@@ -766,6 +824,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         },
         "run_counts": counts,
         "collection_cost_records": [str(path) for path in collection_paths],
+        "compilation_cost_records": [str(path) for path in compilation_paths],
         "classifier_offline_dir": str(offline_dir),
         "distillation_inputs": [
             str(path.expanduser().resolve())
@@ -778,7 +837,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "audit_warnings": audit_warnings,
         "fairness_notes": [
             "The same shared router dataset-collection cost is charged to "
-            "Feature and Raw-Depth routes, but never summed across classifier seeds.",
+            "each independent architecture/seed alternative, together with provenance-linked compilation; repeated sources are counted once.",
             "Distillation teacher-labelled rollouts are simultaneously data "
             "generation and locomotion-policy training; total interactions count "
             "their union once.",

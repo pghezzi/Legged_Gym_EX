@@ -7,15 +7,18 @@ from legged_gym.utils import get_args, task_registry
 import shutil
 import time
 import torch
+from rsl_rl.utils.training_cost import synchronize, reset_peak_memory
 
 from legged_gym.scripts.expand_config import reconstruct_config_file
 
 def train(args):
+    if "distill" in args.task.lower():
+        cost_device = "cpu" if args.cpu else "cuda:0"  # Matches TaskRegistry.make_env.
+        reset_peak_memory(cost_device)
+        synchronize(cost_device)
     post_specialist_started = (
         time.perf_counter() if "distill" in args.task.lower() else None
     )
-    if post_specialist_started is not None and torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
     if SIMULATOR == "genesis":
         gs.init(
             backend=gs.cpu if args.cpu else gs.gpu,

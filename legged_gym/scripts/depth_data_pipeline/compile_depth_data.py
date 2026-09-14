@@ -3,6 +3,9 @@ from legged_gym import LEGGED_GYM_ROOT_DIR
 import json
 import torch
 import os
+import time
+from pathlib import Path
+from rsl_rl.utils.training_cost import WallTimer, stage_accounting, provenance_map, write_cost_record
 
 
 GROUP_METADATA_KEYS = (
@@ -143,8 +146,13 @@ def split_environment_groups(groups, seed=42):
     assert id_sets[1].isdisjoint(id_sets[2])
     return partitions
 
-def get_data_raw(load_file, frac=0.1, seed=42, return_metadata=False):
+def get_data_raw(load_file, frac=0.1, seed=42, return_metadata=False, timings=None):
+    loading_timer = WallTimer().start()
     torch_load = torch.load(load_file, map_location="cpu", weights_only=False)
+    loading_s = loading_timer.stop()
+    if timings is not None:
+        timings["data_loading_s"] += loading_s
+    preprocessing_started = time.perf_counter()
     depth_images = torch_load["depth_images"]
     base_rpy = torch_load["base_rpy"]
     base_ang_vel = torch_load["base_ang_vel"]
@@ -157,6 +165,8 @@ def get_data_raw(load_file, frac=0.1, seed=42, return_metadata=False):
         return_indices=True,
     )
     depth_images, base_rpy, base_ang_vel, terrain_labels, selected_env_ids = sampled
+    if timings is not None:
+        timings["sampling_s"] += time.perf_counter() - preprocessing_started
     if not return_metadata:
         return depth_images, base_rpy, base_ang_vel, terrain_labels
     seed_key, seed_sets = None, None
@@ -181,15 +191,21 @@ def get_data_raw(load_file, frac=0.1, seed=42, return_metadata=False):
 
 def calibration_data(*args, **kwargs):
     calibration_depth, calibration_rpy, calibration_ang_vel, _  = get_data_raw(*args, **kwargs)
-    return {
+    started = time.perf_counter()
+    result = {
         "depth_images": data_flattening(calibration_depth),
         "orientation_rpy": data_flattening(calibration_rpy),
         "angular_velocity": data_flattening(calibration_ang_vel)
     }
 
-def train_val_test_data(load_file, frac=0.1, seed=42, return_manifest=False):
+    if kwargs.get("timings") is not None:
+        kwargs["timings"]["sampling_s"] += time.perf_counter() - started
+    return result
+
+def train_val_test_data(load_file, frac=0.1, seed=42, return_manifest=False, timings=None):
     depth_images, base_rpy, base_ang_vel, terrain_labels, source = get_data_raw(
-        load_file, frac=frac, seed=seed, return_metadata=True)
+        load_file, frac=frac, seed=seed, return_metadata=True, timings=timings)
+    splitting_started = time.perf_counter()
     episode_length = int(depth_images.shape[0])
     groups, group_type = _environment_groups(source["selected_env_ids"], source["seed_sets"])
     partitions = split_environment_groups(groups, seed=seed)
@@ -244,6 +260,8 @@ def train_val_test_data(load_file, frac=0.1, seed=42, return_manifest=False):
         "splits": split_manifest,
     }
     result = (datasets["train"], datasets["val"], datasets["test"])
+    if timings is not None:
+        timings["splitting_s"] += time.perf_counter() - splitting_started
     return (*result, manifest) if return_manifest else result
 
 def merge_sets(*datasets):
@@ -278,10 +296,13 @@ if __name__ == "__main__":
     
 
     args = parser.parse_args()
+    total_timer = WallTimer().start()
+    timings = dict(data_loading_s=0.0, sampling_s=0.0, splitting_s=0.0)
 
     get_data_args = {
         "frac": args.frac,
-        "seed": args.seed
+        "seed": args.seed,
+        "timings": timings
     }
 
     if args.calibration:
@@ -294,9 +315,11 @@ if __name__ == "__main__":
 
     all_data    = [train_val_test_data(file, return_manifest=True, **get_data_args)
                    for file in args.files]
+    merging_timer = WallTimer().start()
     train       = merge_sets(*[data[0] for data in all_data])
     val         = merge_sets(*[data[1] for data in all_data])
     test        = merge_sets(*[data[2] for data in all_data])
+    timings["merging_s"] = merging_timer.stop()
     source_manifests = [data[3] for data in all_data]
 
     print(train["depth_images"].shape)
@@ -306,6 +329,7 @@ if __name__ == "__main__":
     out_dir = f"{LEGGED_GYM_ROOT_DIR}/depth_waq_selector/processed_data/{timestamp}_frac_{str(args.frac).replace('.','_')}"
     os.makedirs(out_dir, exist_ok=True)
 
+    serialization_timer = WallTimer().start()
     with open(os.path.join(out_dir,"parsed_arguments.txt"), "w") as f:
         f.write("Parsed Arguments\n")
         f.write("================\n")
@@ -320,6 +344,8 @@ if __name__ == "__main__":
     if args.calibration:
         torch.save(calibration,  os.path.join(out_dir, "calibration.pt"))
 
+    serialization_s = serialization_timer.stop()
+    manifest_timer = WallTimer().start()
     split_manifest = {
         "split_seed": args.seed,
         "fraction": args.frac,
@@ -347,8 +373,30 @@ if __name__ == "__main__":
     assert split_group_sets["train"].isdisjoint(split_group_sets["val"])
     assert split_group_sets["train"].isdisjoint(split_group_sets["test"])
     assert split_group_sets["val"].isdisjoint(split_group_sets["test"])
+    timings["splitting_s"] += manifest_timer.stop()
+    serialization_timer = WallTimer().start()
     with open(os.path.join(out_dir, "split_manifest.json"), "w", encoding="utf-8") as stream:
         json.dump(split_manifest, stream, indent=2)
 
+    serialization_s += serialization_timer.stop()
+    total_s = total_timer.stop()
+    record = {
+        "schema_version": 2, "run_type": "dataset_compilation",
+        "dataset_path": str(Path(out_dir).resolve()),
+        "source_files": list(dict.fromkeys(split_manifest["source_files"] +
+            ([split_manifest["calibration_source_file"]] if args.calibration else []))),
+        "split_manifest": str(Path(out_dir, "split_manifest.json").resolve()),
+        "data_env_steps": 0, "additional_locomotion_policy_env_steps": 0,
+        "total_post_specialist_env_steps": 0, "gpu_count": 0, "gpu_model": None,
+        **timings,
+        **stage_accounting(total_s, 0, setup_s=timings["data_loading_s"],
+            preprocessing_s=sum(timings[key] for key in ("sampling_s", "splitting_s", "merging_s")),
+            artifact_serialization_s=serialization_s),
+        "notes": ["CPU compilation from raw source loading through split/artifact serialization; sidecar writing excluded.",
+                  "data_loading_s is within setup_s; sampling_s, splitting_s and merging_s are within preprocessing_s.",
+                  "The compiled dataset is a shared preparation artifact; charge it once per integration alternative."],
+    }
+    record["metric_status"] = provenance_map(record)
+    write_cost_record(Path(out_dir) / "training_cost.json", record)
     print(out_dir)
     

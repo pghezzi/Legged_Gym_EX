@@ -12,17 +12,6 @@ from legged_gym.envs.go2.go2_depth_waq.go2_depth_waq_config import (
     Go2DepthWaqCfgPPO,
 )
 
-# This file is located at:
-#
-# Legged_Gym_EX/
-# └── legged_gym/
-#     └── envs/
-#         └── go2/
-#             └── go2_depth_waq_distill/
-#                 └── go2_depth_waq_distill_config.py
-#
-# parents[4] therefore points to the Legged_Gym_EX repository root.
-
 # Load environment variables from:
 #
 # Legged_Gym_EX/.env
@@ -35,6 +24,15 @@ load_dotenv(
 )
 
 import warnings
+
+
+def checkpoint_path(path: str) -> str:
+    """Resolve relative checkpoints from the repository root, not the launch directory."""
+    path = Path(path).expanduser()
+    if not path.is_absolute():
+        path = Path(LEGGED_GYM_ROOT_DIR) / path
+    return str(path.resolve())
+
 
 def required_env(name: str) -> str:
     """Read a required environment variable.
@@ -79,7 +77,7 @@ def optional_int_env(name: str, default: int) -> int:
 
 
 class Go2DepthWaqDistillCfg(Go2DepthWaqCfg):
-    """Environment configuration for multi-teacher LoRA distillation."""
+    """Mixed rough/stairs/gap/pit terrain with fixed depth-policy teachers."""
 
     class viewer(Go2DepthWaqCfg.viewer):
         # Rendering only the two camera environments keeps visual smoke tests
@@ -87,25 +85,31 @@ class Go2DepthWaqDistillCfg(Go2DepthWaqCfg):
         rendered_envs_idx = [0, 1]
 
     class terrain(Go2DepthWaqCfg.terrain):
-        # Keep the ten curriculum columns used by Go2DepthWaqCfg, but dedicate
-        # the first half to stairs and the second half to gaps. The indices
-        # here follow TERRAIN_KEYS in legged_gym.utils.terrain_vars.
+        # Proportions follow TERRAIN_KEYS. With 12 curriculum columns, these
+        # realize 3 rough, 5 stairs (both directions), 2 gap, and 2 pit columns.
+        curriculum = True
+        selected = False
+        custom_selected = False
         num_cols = 12
         terrain_proportions = [
             0.0,  # slope
-            0.0,  # random_uniform
-            0.25,  # stairs
-            0.25,  # upwards_stairs
+            0.20,  # random_uniform
+            0.20,  # stairs
+            0.20,  # upwards_stairs
             0.0,  # discrete_obstacles
             0.0,  # stepping_stones
-            0.25,  # gap
-            0.25,  # pit
+            0.20,  # gap
+            0.20,  # pit
             0.0,  # multiple_high_platforms
             0.0,  # high_platform_gaps
             0.0,
         ]
 
     class rewards(Go2DepthWaqCfg.rewards):
+        class obstacle_progress(Go2DepthWaqCfg.rewards.obstacle_progress):
+            # This helper supports dedicated obstacle terrains, not this mixture.
+            enabled = False
+
         # Gap and stairs teachers were trained with the same reward scales.
         # Define them explicitly because the parent config selects its scales
         # at import time from TERRAIN, whose default is random_uniform.
@@ -136,9 +140,11 @@ class Go2DepthWaqDistillCfg(Go2DepthWaqCfg):
         # Shared LoRA teacher defaults
         # ------------------------------------------------------------------
         #
-        # All teachers use this baseline unless a teacher dictionary supplies
-        # its own "base_model" override.
-        base_model = required_env("DISTILL_BASE_MODEL")
+        # Only LoRA teachers use this initialization checkpoint. Ordinary
+        # ActorCriticDreamWaQDepth teachers load their own full checkpoint.
+        # Relative .env overrides are also resolved from the repository root.
+        base_model = checkpoint_path(os.getenv("DISTILL_BASE_MODEL") or
+            "logs/go2_depth_waq_baseline/Sep09_05-49-24_dreamwaq_isaacgym/model_10000.pt")
 
         # All LoRA components use this rank unless a teacher dictionary
         # overrides "rank" or a component-specific rank.
@@ -148,30 +154,37 @@ class Go2DepthWaqDistillCfg(Go2DepthWaqCfg):
         )
 
         # ------------------------------------------------------------------
-        # LoRA teachers
+        # Full-checkpoint teachers (LoRA can also be selected per dictionary)
         # ------------------------------------------------------------------
         #
         # List order defines the numeric teacher ID:
         #
         #   teachers[0] -> teacher ID 0 -> gap
         #   teachers[1] -> teacher ID 1 -> stairs
+        #   teachers[2] -> teacher ID 2 -> pit
+        #   teachers[3] -> teacher ID 3 -> rough baseline
         #
-        # The checkpoint paths are stored in the local .env file rather than
-        # directly in this committed configuration file.
+        # Paths below are relative to LEGGED_GYM_ROOT_DIR. Absolute paths are
+        # also accepted by checkpoint_path(). Match the class to the checkpoint.
         teachers = [
             {
                 "name": "gap",
-                "checkpoint": "/home/pablo/Documents/Legged_Gym_EX/logs/go2_depth_waq_fft_gap/Aug12_17-01-51_dreamwaq_isaacgym/model_47000.pt",
+                "checkpoint": checkpoint_path("logs/go2_depth_waq_fft_gap/Sep13_19-33-31_dreamwaq_isaacgym/model_50000.pt"),
                 "teacher_actor_critic": "ActorCriticDreamWaQDepth"
             },
             {
                 "name": "stairs",
-                "checkpoint": "/home/pablo/Documents/Legged_Gym_EX/logs/go2_depth_waq_fft_all_stairs/Aug14_14-23-53_dreamwaq_isaacgym/model_47000.pt",
+                "checkpoint": checkpoint_path("logs/go2_depth_waq_fft_all_stairs/Sep11_22-48-38_dreamwaq_isaacgym/model_50000.pt"),
                 "teacher_actor_critic": "ActorCriticDreamWaQDepth"
             },
             {
                 "name": "pit",
-                "checkpoint": "/home/pablo/Documents/Legged_Gym_EX/logs/go2_depth_waq_fft_pit/Aug29_00-30-31_dreamwaq_isaacgym/model_67000.pt",
+                "checkpoint": checkpoint_path("logs/go2_depth_waq_fft_pit/Sep13_20-20-37_dreamwaq_isaacgym/model_54500.pt"),
+                "teacher_actor_critic": "ActorCriticDreamWaQDepth"
+            },
+            {
+                "name": "rough",
+                "checkpoint": checkpoint_path("logs/go2_depth_waq_baseline/Sep09_05-49-24_dreamwaq_isaacgym/model_10000.pt"),
                 "teacher_actor_critic": "ActorCriticDreamWaQDepth"
             },
         ]
@@ -181,16 +194,13 @@ class Go2DepthWaqDistillCfg(Go2DepthWaqCfg):
         # ------------------------------------------------------------------
         #
         # Index:
-        #   Genesis terrain type/column ID
+        #   Simulator terrain column ID (not a TERRAIN_KEYS index)
         #
         # Value:
         #   index into the teachers list above
         #
-        # Curriculum generation assigns the lower-numbered columns to stairs
-        # and the higher-numbered columns to gaps. Teacher 1 is stairs and
-        # teacher 0 is gap, matching the teachers list above.
-        terrain_type_to_teacher = [1] * 6 + [0] * 3 + [2] * 3
-
+        # Columns 0-2: rough; 3-7: stairs; 8-9: gap; 10-11: pit.
+        terrain_type_to_teacher = [3] * 3 + [1] * 5 + [0] * 2 + [2] * 2
         # ------------------------------------------------------------------
         # Pure imitation-learning settings
         # ------------------------------------------------------------------
@@ -278,7 +288,7 @@ class Go2DepthWaqDistillCfgPPO(Go2DepthWaqCfgPPO):
         )
         run_name = "pure_imitation"
 
-        max_iterations = 20000
+        max_iterations = 30000
         save_interval = 500
 
         # Set this only if you later want to initialize the student from an
@@ -288,3 +298,14 @@ class Go2DepthWaqDistillCfgPPO(Go2DepthWaqCfgPPO):
         #resume = True
         #load_run = "Aug03_17-52-31_pure_imitation"
         checkpoint = -1
+
+
+# export SIMULATOR=isaacgym
+# export TERRAIN=baseline
+# export PARKOUR_AUX=0
+# unset FINETUNE DEPTHWAQ_RESUME_UNTIL
+
+# python -m legged_gym.scripts.train \
+#   --task go2_depth_waq_distill \
+#   --max_iterations 30000 \
+#   --headless

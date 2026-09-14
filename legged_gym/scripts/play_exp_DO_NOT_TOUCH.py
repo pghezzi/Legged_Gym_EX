@@ -22,6 +22,8 @@ from rsl_rl.utils.training_cost import (
     provenance_map,
     reset_peak_memory,
     synchronize,
+    stage_accounting,
+    WallTimer,
     write_cost_record,
 )
 
@@ -280,7 +282,7 @@ def override_configs(env_cfg, args):
         "stairs": {
             "type": "terrain_utils.pyramid_stairs_terrain",
             "step_width": 0.4,
-            "step_height": -0.25,
+            "step_height": -0.30,
             "platform_size": 3.0,
         },
         "upwards_stairs": {
@@ -316,7 +318,7 @@ def override_configs(env_cfg, args):
         },
         "pit": {
             "type": "terrain_utils.pit_terrain",
-            "depth": 0.52,
+            "depth": 0.35,
             "platform_size": 3.0,
         },
         "multiple_high_platforms" : {
@@ -501,13 +503,13 @@ def override_configs(env_cfg, args):
                 if terrain_type == "pit":
                     return {
                         "type": "terrain_utils.pit_terrain",
-                        "depth": rng.uniform(0.2, 0.5),
+                        "depth": rng.uniform(0.2, 0.35),
                         "platform_size": 3.0,
                     }
                 if terrain_type == "central":
                     return {
                         "type": "terrain_utils.center_platform_terrain",
-                        "height": rng.uniform(0.2, 0.5),
+                        "height": rng.uniform(0.2, 0.35),
                         "platform_size": 3.0,
                     }
 
@@ -876,9 +878,10 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
     commands[:, 3] = cho[torch.randint(0, cho.shape[0], (env.num_envs,))]
     if args.save_depth_classifier_data:
         print(f"Num of samples generated: {(10* 1000 * env.num_envs) / 5} (aprox)")
-        reset_peak_memory(env.device)
-        collection_total_started = time.perf_counter()
-        collection_started = collection_total_started
+        synchronize(env.device)
+        collection_total_started = args._collection_total_started
+        collection_started = time.perf_counter()
+        collection_setup_s = collection_started - collection_total_started
     #(10* 1000 * 100) / 5 = 2000
     for i in range(int(10.00*env.max_episode_length)):
         if not args.headless and args.follow_robot:
@@ -1167,6 +1170,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         return tuple(shape)
     
     if args.save_depth_classifier_data:
+        preprocessing_timer = WallTimer(env.device).start()
         print("compiling")
         depth_images_tensor = torch.stack(depth_images_log, dim=0).squeeze(2)
         del depth_images_log
@@ -1225,6 +1229,8 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
                 for _ in range(depth_images_tensor.shape[0])
             ]
 
+        collection_preprocessing_s = preprocessing_timer.stop()
+        serialization_timer = WallTimer(env.device).start()
         print("Saving file")
 
         torch.save({
@@ -1238,6 +1244,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             "filtered": args.filter_depth_classifier_data
         }, save_path)
 
+        serialization_s = serialization_timer.stop()
         synchronize(env.device)
         total_wallclock_s = time.perf_counter() - collection_total_started
         completed_episode_count = int(completed_episodes.item())
@@ -1271,7 +1278,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             "control_frequency_hz": control_frequency_hz,
             "simulation_frequency_hz": simulation_frequency_hz,
             "data_generation_s": collection_wallclock_s,
-            "preprocessing_s": 0.0,
+            "preprocessing_s": collection_preprocessing_s,
             "optimization_s": 0.0,
             "total_wallclock_s": total_wallclock_s,
             "gpu_active_time_s": None,
@@ -1280,12 +1287,16 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             "trainable_params": 0,
             **device_info,
             "notes": [
-                "Accounting starts immediately before the unchanged interaction loop and ends after dataset serialization.",
+                "Accounting starts before environment/specialist construction and ends after dataset serialization; setup includes loading, rollout includes online capture/filtering, preprocessing is post-rollout stacking/filtering.",
                 "Environment steps count vectorized control transitions; simulator_substeps additionally applies control decimation.",
                 "GPU-hours are synchronized allocated-device wall-clock; kernel-active time requires an external profiler.",
                 "Specialist-policy training is excluded.",
             ],
         }
+        cost_record.update(stage_accounting(
+            total_wallclock_s, device_info["gpu_count"], setup_s=collection_setup_s,
+            data_generation_s=collection_wallclock_s, preprocessing_s=collection_preprocessing_s,
+            artifact_serialization_s=serialization_s))
         cost_record["metric_status"] = provenance_map(cost_record)
         cost_record["metric_status"]["gpu_active_time_s"] = "unavailable"
         cost_record["metric_status"]["gpu_hours"] = (
@@ -1568,6 +1579,11 @@ def play(args):
     Args:
         args (_type_): command line arguments
     """
+    if args.save_depth_classifier_data:
+        cost_device = "cpu" if args.cpu else args.gpu
+        reset_peak_memory(cost_device)
+        synchronize(cost_device)
+        args._collection_total_started = time.perf_counter()
     if "genesis" in SIMULATOR:
         init_genesis(args, gs)
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)

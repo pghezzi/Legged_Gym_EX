@@ -50,6 +50,7 @@ from .util_func import (
 )
 from rsl_rl.utils.training_cost import (
     WallTimer,
+    stage_accounting,
     artifact_size_mb,
     cuda_device_info,
     peak_memory_mb,
@@ -311,25 +312,34 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
-    dataset_root = args.dataset.expanduser().resolve()
-    structural_dir = _resolve_data_folder(
-        args.classifier_data, dataset_root, ("structural", "classifier"),
-        ("train", "val", "calibration", "test"), "structural")
-    ordered_dir = _resolve_data_folder(
-        args.ordered_data, dataset_root, ("bayesian", "bayes", "sequences"),
-        ("test",), "ordered")
-    output = args.output.expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
     if device == "auto":
         device = "cpu"
 
+    setup_timer = WallTimer(device).start()
+    dataset_root = args.dataset.expanduser().resolve()
+    structural_dir = _resolve_data_folder(
+        args.classifier_data, dataset_root, ("structural", "classifier"),
+        ("train", "val", "calibration", "test"), "structural")
+    output = args.output.expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+
+    loading_timer = WallTimer(device).start()
     train = torch.load(structural_dir / "train.pt", map_location="cpu", weights_only=False)
     validation = torch.load(structural_dir / "val.pt", map_location="cpu", weights_only=False)
+    data_loading_s = loading_timer.stop()
+    class_ids = list(dict.fromkeys(_labels(train["labels"])))
+    unknown = set(_labels(validation["labels"])) - set(class_ids)
+    if unknown:
+        raise ValueError(f"validation contains labels absent from training: {sorted(unknown, key=str)}")
+    shared_setup_s = setup_timer.stop()
+    # Evaluation-only datasets/sequence preparation are outside integration costs.
+    ordered_dir = _resolve_data_folder(
+        args.ordered_data, dataset_root, ("bayesian", "bayes", "sequences"),
+        ("test",), "ordered")
     structural_test = torch.load(structural_dir / "test.pt", map_location="cpu", weights_only=False)
     ordered_test = torch.load(ordered_dir / "test.pt", map_location="cpu", weights_only=False)
-    class_ids = list(dict.fromkeys(_labels(train["labels"])))
-    for name, data in (("validation", validation), ("structural test", structural_test),
+    for name, data in (("structural test", structural_test),
                        ("ordered test", ordered_test)):
         unknown = set(_labels(data["labels"])) - set(class_ids)
         if unknown:
@@ -337,6 +347,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     ordered_ids = sequence_ids_for(ordered_test)
 
     reset_peak_memory(device)
+    feature_total_timer = WallTimer(device).start()
     preprocessing_timer = WallTimer(device).start()
     extractor = make_terrain_extractor(structural_dir / "calibration.pt")
     train_features = extract_dataset_features(extractor, train, chunk_size=args.batch_size)
@@ -344,11 +355,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     standardizer = fit_standardizer(train_features, train["labels"], batch_size=args.batch_size)
     train_features = standardizer.transform(train_features)
     validation_features = standardizer.transform(validation_features)
+    feature_preprocessing_s = preprocessing_timer.stop()
+    feature_serialization_timer = WallTimer(device).start()
     feature_artifacts = output / "artifacts" / "feature_nn"
     feature_artifacts.mkdir(parents=True, exist_ok=True)
     extractor.save(feature_artifacts / "extractor.pt")
     standardizer.save(feature_artifacts / "standardizer.pt")
-    feature_preprocessing_s = preprocessing_timer.stop()
+    feature_serialization_s = feature_serialization_timer.stop()
+    feature_total_s = feature_total_timer.stop()
     feature_preprocessing_peak_mb = peak_memory_mb(device)
 
     experiment_1_rows, experiment_2_rows, training_records = [], [], []
@@ -359,6 +373,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             # Match the existing raw-depth trainer while avoiding a second copy
             # of these large packed inputs during all feature-NN runs.
             reset_peak_memory(device)
+            raw_total_timer = WallTimer(device).start()
             preprocessing_timer = WallTimer(device).start()
             raw_train = pack_raw_depth_state_inputs(
                 train["depth_images"], train["orientation_rpy"], train["angular_velocity"])
@@ -366,8 +381,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 validation["depth_images"], validation["orientation_rpy"],
                 validation["angular_velocity"])
             raw_preprocessing_s = preprocessing_timer.stop()
+            raw_total_s = raw_total_timer.stop()
             raw_preprocessing_peak_mb = peak_memory_mb(device)
         for seed in MODEL_SEEDS:
+            seed_total_timer = WallTimer(device).start()
+            model_setup_timer = WallTimer(device).start()
             _set_seed(seed)
             if architecture == "feature_nn":
                 model = TerrainDepthFeatureClassifierNN(
@@ -383,6 +401,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             classifier = NeuralClassifierAdapter(model, class_ids, fit_callback=fit_nn, device=device)
             classifier.require_feature = architecture == "feature_nn"
             reset_peak_memory(device)
+            model_setup_s = model_setup_timer.stop()
             optimization_timer = WallTimer(device).start()
             classifier.fit(
                 train_inputs, train["labels"], val=(validation_inputs, validation["labels"]),
@@ -412,11 +431,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                 feature_preprocessing_peak_mb if architecture == "feature_nn"
                 else raw_preprocessing_peak_mb
             )
+            seed_total_s = seed_total_timer.stop()
+            shared_preparation_s = feature_total_s if architecture == "feature_nn" else raw_total_s
+            total_s = shared_setup_s + shared_preparation_s + seed_total_s
+            all_serialization_s = serialization_s + (feature_serialization_s if architecture == "feature_nn" else 0.)
             cost_record = {
                 "schema_version": 1,
                 "run_type": "classifier_training",
                 "method": "Feature Router" if architecture == "feature_nn" else "Raw-Depth Router",
                 "architecture": architecture, "seed": seed, "model_path": str(model_path),
+                "structural_dataset": str(structural_dir),
+                "data_loading_s": data_loading_s,
+                "shared_preparation_s": shared_setup_s + shared_preparation_s,
                 "model_args_path": str(args_path), "training_history_path": str(history_path),
                 "dropout_p": config["dropout_p"], "weight_decay": config["weight_decay"],
                 "training_runtime_seconds": training_seconds,
@@ -468,6 +494,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "Optimizer updates are counted at each optimizer.step call.",
                 ],
             }
+            cost_record.update(stage_accounting(total_s, cost_record["gpu_count"],
+                setup_s=shared_setup_s + model_setup_s, preprocessing_s=preprocessing_s,
+                optimization_s=training_seconds, artifact_serialization_s=all_serialization_s))
+            cost_record["total_classifier_training_s"] = total_s
+            cost_record["notes"].append(
+                "Setup includes train/validation loading and model construction; calibration loading/fitting is preprocessing. "
+                "Shared preparation is charged once per independent seed/architecture alternative; evaluation-only loading, sequence preparation and inference are excluded.")
             cost_record["metric_status"] = provenance_map(cost_record)
             cost_record["metric_status"]["optimizer_updates"] = (
                 "measured" if "optimizer_updates" in classifier.training_history

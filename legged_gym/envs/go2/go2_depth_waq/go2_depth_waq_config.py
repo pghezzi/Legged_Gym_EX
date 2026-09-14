@@ -104,7 +104,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
         }
         terrain_curriculum_difficulty.update(terrain_curriculum_difficulty_custom)
         terrain_proportions = terrain_list
-        max_init_terrain_level = 5 # starting curriculum level
+        # max_init_terrain_level = 5 # starting curriculum level
         #terrain_proportions = [0] * 11
         #terrain_proportions[10] = 1
         
@@ -149,7 +149,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
 
         class obstacle_progress:
             # Opt-in, dedicated IsaacGym simplified GAP/PIT/STAIRS only.
-            enabled = True
+            enabled = False
             # [k_progress (reward/metre), b0 (reward), b1 (reward/unit difficulty)]
             gap = [0.40, 0.20, 0.5]
             pit = [0.40, 0.20, 0.5]
@@ -524,9 +524,26 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
 
 # python -m legged_gym.scripts.play_exp \
 #   --task go2_depth_waq \
-#   --load_run /workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_pit/Sep11_22-12-25_dreamwaq_isaacgym \
-#   --ckpt 50000 \
+#   --load_run /workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_pit/Sep13_20-20-37_dreamwaq_isaacgym \
+#   --ckpt 54500 \
 #   --num_envs 1 \
 #   --curriculum \
 #   --test_terrain pit \
-#   --follow_robot
+#   --follow_robot \
+#   --start_terrain_level 4
+
+
+
+# export TERRAIN=all_stairs
+# export PARKOUR_AUX=0
+# export FINETUNE=1
+# unset DEPTHWAQ_RESUME_UNTIL
+
+# python -m legged_gym.scripts.play_exp \
+#   --task go2_depth_waq \
+#   --load_run /workspace/LeggedGym-Ex/logs/go2_depth_waq_fft_all_stairs/Sep11_22-48-38_dreamwaq_isaacgym \
+#   --ckpt -1 \
+#   --num_envs 1 \
+#   --curriculum \
+#   --test_terrain all_stairs \
+#   --follow_robot \

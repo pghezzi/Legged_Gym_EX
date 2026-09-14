@@ -14,6 +14,8 @@ from rsl_rl.utils.training_cost import (
     peak_memory_mb,
     provenance_map,
     synchronize,
+    stage_accounting,
+    WallTimer,
     write_cost_record,
 )
 
@@ -38,6 +40,7 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
         device="cpu",
     ):
         self._cost_device = torch.device(device)
+        synchronize(device)
         self._post_specialist_started = time.perf_counter()
         self.distillation_cfg = env.cfg.distillation
         super().__init__(env, train_cfg, log_dir, device)
@@ -144,6 +147,7 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
         cost_start_iteration = self.current_learning_iteration
         session_data_generation_s = 0.0
         session_optimization_s = 0.0
+        session_serialization_s = 0.0
         session_optimizer_updates = 0
         session_completed_episodes = torch.zeros(
             (), dtype=torch.long, device=self.device
@@ -184,12 +188,14 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
             + num_learning_iterations
         )
 
+        synchronize(self.device)
+        setup_s = time.perf_counter() - self._post_specialist_started
         for iteration in range(
             self.current_learning_iteration,
             total_iterations,
         ):
             synchronize(self.device)
-            start = time.time()
+            start = time.perf_counter()
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     teacher_ids = self.env.get_teacher_ids().to(
@@ -253,12 +259,12 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
                             cur_episode_length[done_ids] = 0
 
             synchronize(self.device)
-            collection_time = time.time() - start
+            collection_time = time.perf_counter() - start
             synchronize(self.device)
-            start = time.time()
+            start = time.perf_counter()
             mean_loss, stats = self.alg.update()
             synchronize(self.device)
-            learn_time = time.time() - start
+            learn_time = time.perf_counter() - start
             session_data_generation_s += collection_time
             session_optimization_s += learn_time
             session_optimizer_updates += int(stats["optimizer_updates"])
@@ -277,21 +283,25 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
                 )
 
             if iteration % self.save_interval == 0:
+                serialization_timer = WallTimer(self.device).start()
                 self.save(
                     os.path.join(
                         self.log_dir,
                         f"model_{iteration}.pt",
                     )
                 )
+                session_serialization_s += serialization_timer.stop()
             ep_infos.clear()
 
         self.current_learning_iteration += num_learning_iterations
+        serialization_timer = WallTimer(self.device).start()
         self.save(
             os.path.join(
                 self.log_dir,
                 f"model_{self.current_learning_iteration}.pt",
             )
         )
+        session_serialization_s += serialization_timer.stop()
         final_checkpoint = os.path.join(
             self.log_dir, f"model_{self.current_learning_iteration}.pt"
         )
@@ -351,6 +361,10 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
                 "GPU-hours are synchronized allocated-device wall-clock; kernel-active time requires an external profiler.",
             ],
         }
+        cost_record.update(stage_accounting(
+            total_wallclock_s, device_info["gpu_count"], setup_s=setup_s,
+            data_generation_s=session_data_generation_s, optimization_s=session_optimization_s,
+            artifact_serialization_s=session_serialization_s))
         cost_record["metric_status"] = provenance_map(cost_record)
         cost_record["metric_status"]["gpu_active_time_s"] = "unavailable"
         cost_record["metric_status"]["gpu_hours"] = (
@@ -372,6 +386,11 @@ class DreamWaQDepthDistillRunner(OnPolicyRunner):
                 ):
                     if previous.get(key) is not None and cost_record.get(key) is not None:
                         cost_record[key] += previous[key]
+                for key in ("setup_s", "preprocessing_s", "artifact_serialization_s", "overhead_s"):
+                    cost_record[key] = (previous[key] + cost_record[key]
+                                        if previous.get(key) is not None else None)
+                    cost_record["metric_status"][key] = (
+                        "measured" if cost_record[key] is not None else "unavailable")
                 previous_peak = previous.get("peak_gpu_memory_mb")
                 if previous_peak is not None:
                     cost_record["peak_gpu_memory_mb"] = max(
