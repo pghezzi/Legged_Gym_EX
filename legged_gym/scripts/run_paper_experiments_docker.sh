@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Only the new, exclusively created run directory is writable from the container.
+# Only the managed run directory is writable (existing runs require --resume).
 set -euo pipefail
 
 usage() {
@@ -26,6 +26,7 @@ Modes: offline | locomotion | all | plot-only | cost-only
   --output-root DIR         Default: <repository>/paper_runs (PAPER_OUTPUT_ROOT)
   --run-id NAME             New directory name; existing names are rejected.
                             Default: timestamp plus a unique random suffix.
+  --resume                  Locomotion only: reuse --run-id; skip completed conditions.
   --offline-arg TOKEN       Repeat once per additional offline argument/value.
   --locomotion-arg TOKEN    Repeat once per additional locomotion argument/value.
                             Path/mode overrides are reserved by this wrapper.
@@ -48,6 +49,7 @@ HELP
 }
 die() { printf 'Error: %s\n' "$*" >&2; exit 2; }
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+resume=false
 mode=${1:---help}
 case "$mode" in -h|--help) usage; exit 0;; offline|locomotion|all|plot-only|cost-only) shift;; *) usage >&2; exit 2;; esac
 image=${PAPER_IMAGE:-leggedgym-ex:isaacgym}
@@ -62,6 +64,7 @@ deployment_targets=() deployment_files=()
 while (($#)); do
     case "$1" in
         --help|-h) usage; exit 0;;
+        --resume) resume=true; shift; continue;;
         --dry-run) dry_run=true; shift; continue;;
         --path-map|--deployment-artifact)
             (($# >= 3)) && [[ -n $2 && -n $3 ]] || die "Missing values for $1"
@@ -150,7 +153,12 @@ fi
 output_root=$(realpath -m -- "$output_root")
 run_id=${run_id:-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM}
 run_dir=$output_root/$run_id
-[[ ! -e $run_dir && ! -L $run_dir ]] || die "Run already exists (will not overwrite): $run_dir"
+if $resume; then
+    [[ $mode == locomotion ]] || die '--resume is supported only for locomotion'
+    [[ -d $run_dir/locomotion/runs && ! -L $run_dir ]] || die "No existing locomotion run: $run_dir"
+else
+    [[ ! -e $run_dir && ! -L $run_dir ]] || die "Run already exists (will not overwrite): $run_dir"
+fi
 workspace=/workspace/LeggedGym-Ex
 mounts=() mappings=() cost_maps=()
 declare -A canonical_mounts=()
@@ -167,8 +175,13 @@ mount_path() {
         cost_maps+=(--path-map "$host" "$target")
     fi
 }
-mount_path "$repo/legged_gym" "$workspace/legged_gym" readonly
-mount_path "$repo/rsl_rl" "$workspace/rsl_rl" readonly
+source_root=$repo
+if [[ $mode == locomotion || $mode == all ]]; then
+    # Freeze the code used by every subprocess; read-only live binds still see host edits.
+    source_root="$run_dir/source_snapshot_$(date -u +%Y%m%dT%H%M%SZ)_$$"
+fi
+mount_path "$source_root/legged_gym" "$workspace/legged_gym" readonly
+mount_path "$source_root/rsl_rl" "$workspace/rsl_rl" readonly
 mount_path "$run_dir" /paper ''
 mount_path "$run_dir/logs" "$workspace/logs" ''
 if [[ -n $classifier_data ]]; then
@@ -291,8 +304,20 @@ fi
 command -v docker >/dev/null || die 'docker is not installed'
 umask 000
 mkdir -p -- "$output_root"
-mkdir -- "$run_dir" # Atomic exclusive creation; never reuse or chmod old results.
-mkdir -- "$run_dir/offline" "$run_dir/locomotion" "$run_dir/costs" "$run_dir/logs"
+if ! $resume; then
+    mkdir -- "$run_dir" # Atomic exclusive creation unless resume was explicitly requested.
+fi
+mkdir -p -- "$run_dir/offline" "$run_dir/locomotion" "$run_dir/costs" "$run_dir/logs"
+if [[ $source_root != "$repo" ]]; then
+    mkdir -- "$source_root"
+    cp -R -- "$repo/legged_gym" "$repo/rsl_rl" "$source_root/"
+    if $resume; then
+        mkdir -- "$source_root/previous_launcher_metadata"
+        for record in run_metadata.txt git_status.txt mounts.txt exit_status; do
+            [[ ! -f $run_dir/$record ]] || cp -- "$run_dir/$record" "$source_root/previous_launcher_metadata/"
+        done
+    fi
+fi
 heartbeat_pid=
 stop_heartbeat() {
     if [[ -n $heartbeat_pid ]]; then
@@ -354,7 +379,7 @@ run_stage() {
         heartbeat_pid=$!
     fi
     set +e
-    "${command[@]}" 2>&1 | tee "$run_dir/logs/$stage.log"
+    "${command[@]}" 2>&1 | tee -a "$run_dir/logs/$stage.log"
     local codes=("${PIPESTATUS[@]}")
     set -e
     stop_heartbeat

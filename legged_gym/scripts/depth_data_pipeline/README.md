@@ -150,6 +150,15 @@ the selected Bayes and EMA baseline parameters.
 
 ### Docker launcher (persistent shared outputs)
 
+Locomotion/all runs snapshot `legged_gym` and `rsl_rl` into the output directory
+before launching: edits to the working tree cannot break later sweep subprocesses.
+An environment/config import preflight runs before simulation. To resume an interrupted
+locomotion sweep, repeat its launcher command with the same `--run-id` and `--resume`.
+Keep the original difficulty settings and input artifacts; completed valid conditions
+are skipped, missing ones run, and aggregation/replay follows automatically. Resume
+uses a fresh source snapshot and appends console logs. Do not use `--force` unless
+you intend to rerun completed conditions.
+
 From the repository root, use Bash (no TTY required). This reuses the
 `leggedgym-ex:isaacgym` image/venv and mounts source subdirectories, not the
 workspace containing `.venv`. Inputs are mounted read-only. Every invocation

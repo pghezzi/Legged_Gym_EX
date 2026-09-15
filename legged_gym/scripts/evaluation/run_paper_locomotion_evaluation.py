@@ -178,6 +178,7 @@ def _run_conditions(args):
                                 and latency_samples.get("total_inference_ms_per_control_step")
                                 and latency_samples.get("batch1_deployment_latency_ms")
                                 and replay_ready):
+                            print(f"Skipping completed condition: {result_path}", flush=True)
                             results.append(result_path)
                             continue
                     if args.aggregate_only:
@@ -1133,6 +1134,11 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     args.output.mkdir(parents=True, exist_ok=True)
+    # Fail before an expensive sweep if a config edit broke environment imports.
+    # Importing registers tasks but does not instantiate or step a simulator.
+    print("Checking locomotion environment/config imports...", flush=True)
+    subprocess.run([sys.executable, "-c",
+                    "import legged_gym.scripts.evaluation.high_level_evaluation"], check=True)
     paths = _run_conditions(args)
     payloads, layouts = _load_results(paths)
     if not payloads:

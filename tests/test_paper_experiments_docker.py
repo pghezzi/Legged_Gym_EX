@@ -46,6 +46,18 @@ class PaperDockerLauncherTests(unittest.TestCase):
         return ["--classifier-data", self.inputs, "--ordered-data", self.inputs,
                 "--jit", self.inputs / "specialist.pt", "--distilled-jit", self.inputs / "distilled.pt"]
 
+    def test_resume_is_explicit_and_uses_frozen_source(self):
+        run = self.root / "outputs/test-run"
+        (run / "locomotion/runs").mkdir(parents=True)
+        inputs = [*self.common(), "--paper-offline-dir", self.offline, "--dry-run"]
+        self.assertNotEqual(self.launch("locomotion", *inputs).returncode, 0)
+        result = self.launch("locomotion", *inputs, "--resume")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("source_snapshot_", result.stdout)
+        self.assertIn(str(run), result.stdout)
+        self.assertFalse(list(run.glob("source_snapshot_*")))
+        self.assertNotEqual(self.launch("all", *self.common(), "--resume", "--dry-run").returncode, 0)
+
     def test_syntax_help_and_all_dry_run(self):
         subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
         self.assertEqual(subprocess.run(["bash", str(SCRIPT), "--help"], capture_output=True).returncode, 0)

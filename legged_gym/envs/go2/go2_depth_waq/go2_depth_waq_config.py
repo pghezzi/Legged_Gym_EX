@@ -149,7 +149,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
 
         class obstacle_progress:
             # Opt-in, dedicated IsaacGym simplified GAP/PIT/STAIRS only.
-            enabled = False
+            enabled = terrain_name in ("gap", "pit", "stairs", "all_stairs")
             # [k_progress (reward/metre), b0 (reward), b1 (reward/unit difficulty)]
             gap = [0.40, 0.20, 0.5]
             pit = [0.40, 0.20, 0.5]
@@ -164,7 +164,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
             support_height_tolerance = 0.06  # m
             stationary_speed = 0.05  # m/s, stationary threshold
             stationary_radius = 1.0  # m from crossing path (penalty), final edge (time log)
-            stationary_penalty_rate = 0.05  # reward/s deducted; 0 disables penalty
+            stationary_penalty_rate = 0.10  # reward/s deducted; 0 disables penalty
             stationary_grace_s = 0.10  # continuous stationary time before charging
 
         use_reward_curriculum = False
@@ -174,14 +174,20 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
             curr_reward_keys = [
                                 "torque_limits",
                                 "dof_vel",
-                                "dof_vel_limits"]
+                                "dof_vel_limits",
+                                "action_rate",
+                                "action_smoothness",
+                                "collision"]
             curr_reward_bounds = {
-                "torque_limits": [-0.01, -0.012],
-                "dof_vel": [-0.00001, -0.0001],
-                "dof_vel_limits": [-0.01, -0.1],
+                "torque_limits": [-0.01, -1.0],
+                "dof_vel": [-1.0e-6, -1.0e-2],
+                "dof_vel_limits": [-0.0001, -0.1],
+                "action_rate":[-1.0e-6, -1.0e-2],
+                "action_smoothness":[-1.0e-6, -1.0e-2],
+                "collision":[-0.1, -1.0],
             }
-            warmup_steps = 10000
-            curr_steps = 10000
+            warmup_steps = 20000
+            curr_steps = 20000
         
         soft_dof_pos_limit = 0.9
         soft_dof_vel_limit = 0.9
@@ -203,9 +209,10 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
             base_height = -1.0
             #torque_limits = -0.001
             torque_limits = -0.1
-            dof_vel_limits = -0.01
+            dof_vel_limits = -0.1
             dof_vel = -0.0001
             if terrain_name in ("baseline"):
+                use_reward_curriculum = False
                 torque_limits = -0.01
                 dof_close_to_default = -0.01
                 # limitation
@@ -223,14 +230,15 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                 action_smoothness = -0.01
                 # gait
                 feet_air_time = 1.0
-                foot_clearance = 0.2
+                foot_clearance_terrain_aware = 0.2
                 feet_contact_stand_still = 0.5
                 dof_close_to_default_stand_still = -0.5
             elif terrain_name in ("gap", "stairs", "all_stairs"):
+                use_reward_curriculum = True
                 dof_pos_limits = -2.0
                 collision = -2.0
                 tracking_lin_vel = 2.0
-                tracking_ang_vel = 1.0
+                tracking_ang_vel = 0.5
                 lin_vel_z = -0.1
                 ang_vel_xy = -0.05
                 orientation = -1.0
@@ -245,10 +253,11 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                 feet_near_edge = -1.0
                 feet_air_time = 0.6
             elif terrain_name in ("pit", "center_platform", "all_pit"):
+                use_reward_curriculum = True
                 dof_pos_limits = -2.0
                 collision = -2.0
-                tracking_lin_vel = 1.5
-                tracking_ang_vel =  1.0
+                tracking_lin_vel = 2.0
+                tracking_ang_vel =  0.5
                 lin_vel_z = -0.1
                 ang_vel_xy = -0.05
                 orientation = -0.1
@@ -472,9 +481,9 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
             #elif terrain_name in ("stairs", "gap"):
             #    max_iterations = 30000
             elif terrain_name in ("pit"):
-                max_iterations = 65000
+                max_iterations = 80000
             else:
-                max_iterations = 40000
+                max_iterations = 60000
 
 
 # uv pip install python-dotenv
