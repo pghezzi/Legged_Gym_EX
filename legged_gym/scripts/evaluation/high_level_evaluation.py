@@ -46,12 +46,12 @@ PAPER_METHOD_SPECS = {
     "raw_depth_bayes": ("raw_depth_nn", "bayes"),
 }
 DIFFICULTY_LEVELS = {
-    "easy": {"normalized": 0.25, "pit_depth": 0.20,
-             "stair_magnitude": 0.10, "gap_width": 0.40},
-    "nominal": {"normalized": 0.50, "pit_depth": 0.35,
+    "easy": {"normalized": 0.25, "pit_depth": 0.25,
+             "stair_magnitude": 0.15, "gap_width": 0.40},
+    "nominal": {"normalized": 0.50, "pit_depth": 0.30,
                 "stair_magnitude": 0.20, "gap_width": 0.60},
-    "hard": {"normalized": 0.75, "pit_depth": 0.50,
-             "stair_magnitude": 0.30, "gap_width": 0.80},
+    "hard": {"normalized": 0.75, "pit_depth": 0.35,
+             "stair_magnitude": 0.25, "gap_width": 0.80},
 }
 
 # Keep evaluation randomization identical to low_level_evaluation.py.
@@ -66,7 +66,7 @@ EVAL_DOMAIN_RANDOMIZATION_RANGES = {
     "ctrl_delay_step_range": [0, 0],
     "joint_armature_range": [0.020, 0.020],
     "joint_friction_range": [0.015, 0.015],
-    "joint_damping_range": [0.275, 0.275],
+    "joint_damping_range": [0.40, 0.40],
     "camera_com_displacement_range": [0.0, 0.0, 0.0],
     "camera_euler_offset_range": [0.0, 0.0, 0.0],
 }
