@@ -53,6 +53,36 @@ class _FeatureExport(nn.Module):
         return self.model((features - self.mean) / self.std)
 
 
+def _trace_classifier(module, height, width):
+    """Validate tracing on changing depth masks and IMU, including empty frames."""
+    generator = torch.Generator().manual_seed(0)
+    random_depth = torch.rand(1, height, width, generator=generator) * 0.96 + 0.03
+    mixed_depth = random_depth.clone()
+    mixed_depth[:, ::2, ::2] = 0.0
+    mixed_depth[:, 1::2, 1::2] = 1.0
+    sparse_depth = torch.zeros_like(random_depth)
+    sparse_depth[:, height // 2, width // 2] = 0.5
+    depths = [
+        torch.zeros_like(random_depth), torch.ones_like(random_depth),
+        random_depth, mixed_depth, sparse_depth,
+        torch.linspace(0.05, 0.95, height).reshape(1, height, 1).expand(1, height, width),
+    ]
+    example = (depths[0], torch.zeros(1, 3), torch.zeros(1, 3))
+    with torch.inference_mode(), warnings.catch_warnings():
+        # Image shape/crop layout is fixed; masked reductions remain scripted.
+        warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
+        exported = torch.jit.trace(module, example, strict=False)
+        for index, depth in enumerate(depths):
+            rpy = torch.tensor([[0.03, -0.12, 0.2]]) if index else example[1]
+            omega = torch.tensor([[0.2, -0.1, 0.3]]) if index else example[2]
+            reference, actual = module(depth, rpy, omega), exported(depth, rpy, omega)
+            if not torch.allclose(reference, actual, atol=1e-5, rtol=1e-5):
+                raise RuntimeError(
+                    f"TorchScript export does not match the source classifier "
+                    f"on depth/IMU validation case {index}")
+    return exported
+
+
 def _model_from_artifacts(architecture: str, checkpoint: Path, args_path: Path):
     model_args = dict(torch.load(args_path, map_location="cpu", weights_only=False))
     cls_name = model_args.pop("cls")
@@ -82,18 +112,7 @@ def export_classifier(*, architecture, checkpoint, model_args_path, output,
         standardizer = FeatureStandardizer.load(standardizer_path)
         module = _FeatureExport(adapter.model, extractor, standardizer)
         height, width = 48, 64
-    example = (torch.zeros(1, height, width), torch.zeros(1, 3), torch.zeros(1, 3))
-    with torch.inference_mode(), warnings.catch_warnings():
-        # The engineered extractor uses Python shape validation and B=1
-        # per-frame statistics. Those appear as TracerWarnings even though
-        # this deployment artifact deliberately has a fixed [1, 48, 64]
-        # contract. Keep trace checking below; silence only this expected
-        # warning class, not ordinary export/runtime failures.
-        warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
-        exported = torch.jit.trace(module, example, strict=False)
-        reference, actual = module(*example), exported(*example)
-    if not torch.allclose(reference, actual, atol=1e-5, rtol=1e-5):
-        raise RuntimeError("TorchScript export does not match the source classifier")
+    exported = _trace_classifier(module, height, width)
     output.parent.mkdir(parents=True, exist_ok=True)
     exported.save(str(output))
     manifest = {

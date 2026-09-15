@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
-from typing import Any, Hashable, Mapping, Sequence
+from typing import Any, Hashable, List, Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -71,6 +71,35 @@ class EvaluationResult:
 # =============================================================================
 # Depth + IMU feature extractor
 # =============================================================================
+
+
+@torch.jit.script
+def _masked_quantile_dynamic(x: torch.Tensor, mask: torch.Tensor, q: float) -> torch.Tensor:
+    # Scripting preserves empty-mask branches when the enclosing model is traced.
+    outputs = torch.jit.annotate(List[torch.Tensor], [])
+    for index in range(x.shape[0]):
+        values = x[index][mask[index]]
+        if values.numel() == 0:
+            outputs.append(torch.zeros((), dtype=x.dtype, device=x.device))
+        else:
+            outputs.append(torch.quantile(values, q))
+    return torch.stack(outputs)
+
+
+@torch.jit.script
+def _masked_topk_mean_dynamic(
+    x: torch.Tensor, mask: torch.Tensor, fraction: float,
+) -> torch.Tensor:
+    outputs = torch.jit.annotate(List[torch.Tensor], [])
+    for index in range(x.shape[0]):
+        values = x[index][mask[index]]
+        if values.numel() == 0:
+            outputs.append(torch.zeros((), dtype=x.dtype, device=x.device))
+        else:
+            # The number of valid pixels, and therefore k, changes between frames.
+            k = max(1, int(round(values.numel() * fraction)))
+            outputs.append(torch.topk(values, k=k, largest=True, sorted=False).values.mean())
+    return torch.stack(outputs)
 
 
 class SobelDepthTerrainFeatureExtractor:
@@ -706,27 +735,10 @@ class SobelDepthTerrainFeatureExtractor:
         return (x * mask_f).sum(dim=2) / mask_f.sum(dim=2).clamp_min(1.0)
 
     def _masked_quantile(self, x: torch.Tensor, mask: torch.Tensor, q: float) -> torch.Tensor:
-        # Batch sizes are normally small and deployment uses B=1. A short per-sample
-        # loop avoids fragile sentinel-based quantile approximations.
-        outputs: list[torch.Tensor] = []
-        for sample, sample_mask in zip(x, mask):
-            values = sample[sample_mask]
-            if values.numel() == 0:
-                outputs.append(torch.zeros((), dtype=x.dtype, device=x.device))
-            else:
-                outputs.append(torch.quantile(values, q))
-        return torch.stack(outputs)
+        return _masked_quantile_dynamic(x, mask, q)
 
     def _masked_topk_mean(self, x: torch.Tensor, mask: torch.Tensor, fraction: float) -> torch.Tensor:
-        outputs: list[torch.Tensor] = []
-        for sample, sample_mask in zip(x, mask):
-            values = sample[sample_mask]
-            if values.numel() == 0:
-                outputs.append(torch.zeros((), dtype=x.dtype, device=x.device))
-                continue
-            k = max(1, int(round(values.numel() * fraction)))
-            outputs.append(torch.topk(values, k=k, largest=True, sorted=False).values.mean())
-        return torch.stack(outputs)
+        return _masked_topk_mean_dynamic(x, mask, fraction)
     
     def save(self, path: str | Path) -> None:
         """Save the extractor's configuration and flat-ground calibration state."""
