@@ -17,6 +17,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from legged_gym.scripts.evaluation.locomotion_diagnostics import (
+    VERSION as DIAGNOSTIC_VERSION, EpisodeQuota, heading_feedback, input_validity,
+    boundary_events,
+)
 
 
 
@@ -777,11 +781,8 @@ def _force_commands(env, selected_skills, fixed_command, heading_gain=0.4, max_y
     lateral_error = center_y - current_y  # +y means center is to the left
 
     # Bearing to a lookahead point straight ahead + laterally corrected,
-    # expressed relative to current heading (small-angle style, no backward flips)
-    target_heading_offset = torch.atan2(lateral_error, torch.full_like(lateral_error, lookahead))
-
-    heading_error = wrap_to_pi(target_heading_offset)
-    yaw_rate_cmd = (heading_gain * heading_error).clamp(-max_yaw_rate, max_yaw_rate)
+    # expressed relative to current world heading, wrapped across +/-pi.
+    yaw_rate_cmd = heading_feedback(lateral_error, env.heading, lookahead, heading_gain, max_yaw_rate)
     env.commands[:, 2] = yaw_rate_cmd
 
     if env.commands.shape[1] > 3:
@@ -791,8 +792,7 @@ def _force_commands(env, selected_skills, fixed_command, heading_gain=0.4, max_y
 
 
 def _depth_valid(depth):
-    flattened = depth.reshape(depth.shape[0], -1)
-    return torch.isfinite(flattened).all(dim=1) & (flattened.abs().sum(dim=1) > 0)
+    return input_validity(depth)
 
 
 def _summary_rows(rows, track_id=None):
@@ -971,6 +971,10 @@ def run_eval(args):
     episode_switches = torch.zeros_like(inst_correct)
     episode_delays = [[] for _ in range(env.num_envs)]
     completed_by_track = [0] * 10
+    quota = EpisodeQuota(track_ids.detach().cpu().tolist(), args.episodes_per_track)
+    episode_control_traces = [[(0.,float(start_x[i]))] for i in range(env.num_envs)]
+    episode_replay = [[] for _ in range(env.num_envs)]
+    episode_reset_step = [0] * env.num_envs
     episode_rows = []
     classification = ClassificationStats()
     trajectory_replay = defaultdict(list)
@@ -994,6 +998,7 @@ def run_eval(args):
     classification_updates_seen = 0
 
     while steps_run < args.num_steps and min(completed_by_track) < args.episodes_per_track:
+        eligible = list(quota.active)  # Immutable for this entire pre-reset transition.
         _force_commands(env, selected_skills, args.fixed_forward_command)
         policy_started = _timing_start(device)
         with torch.inference_mode():
@@ -1028,6 +1033,10 @@ def run_eval(args):
         step_positions = env.simulator.base_pos.clone()
         for env_id, state in terminal_capture.states.items():
             step_positions[env_id] = state["position"]
+        for env_id in range(env.num_envs):
+            if eligible[env_id]:
+                episode_control_traces[env_id].append(
+                    (steps_run * float(env.dt), float(step_positions[env_id, 0])))
         finish_distance = (finish_x - start_x).clamp_min(0.0)
         progress = (step_positions[:, 0] - start_x).clamp_min(0.0)
         max_progress = torch.maximum(max_progress, torch.minimum(progress, finish_distance))
@@ -1054,7 +1063,7 @@ def run_eval(args):
                 raw_truth, canonical_truth = get_ground_truth_labels(env, args.look_ahead_frac)
             valid = (torch.ones(env.num_envs, dtype=torch.bool, device=device)
                      if selector_mode == "oracle" and paper_method == "oracle"
-                     else _depth_valid(depth))
+                     else input_validity(depth, env.simulator._base_euler, env.simulator.base_ang_vel))
             if done_ids:
                 valid[list(done_ids)] = False
             valid_ids = valid.nonzero(as_tuple=False).flatten()
@@ -1075,46 +1084,29 @@ def run_eval(args):
                     selection_initialized[env_id] = True
                 stage_timing["skill_selection_ms"] = _timing_stop(skill_started, device)
                 for env_id, changed in oracle_outputs:
+                    if not eligible[env_id]:
+                        continue
                     if changed:
                         classification.switch_count += 1
                         episode_switches[env_id] += 1
                     selected_correct[env_id] += 1
                     selected_total[env_id] += 1
+                    inst_correct[env_id] += 1
+                    inst_total[env_id] += 1
+                    bayes_correct[env_id] += 1
+                    bayes_total[env_id] += 1
                     truth = canonical_truth[env_id]
                     if previous_truth[env_id] is not None and truth != previous_truth[env_id]:
                         classification.delays.append(0)
                         episode_delays[env_id].append(0)
                     previous_truth[env_id] = truth
                     track_id = int(track_ids[env_id].item())
-                    if completed_by_track[track_id] < args.episodes_per_track:
-                        position = env.simulator.base_pos[env_id].detach()
-                        segment = min(max(int(float(position[0]) /
-                                              env_cfg.terrain.terrain_length), 0), 4)
-                        sequence = args.track_layout[track_id]["sequence"]
-                        next_segment = sequence[segment + 1] if segment < 4 else None
-                        boundary_x = ((segment + 1) * env_cfg.terrain.terrain_length
-                                      if segment < 4 else None)
-                        trajectory_replay[track_id].append({
-                            "episode_index": completed_by_track[track_id],
-                            "environment_id": env_id, "track_id": track_id,
-                            "control_step": steps_run,
-                            "timestamp_s": steps_run * float(env.dt),
-                            "depth": depth[env_id].detach().cpu().clone(),
-                            "orientation_rpy":
-                                env.simulator._base_euler[env_id].detach().cpu().clone(),
-                            "angular_velocity":
-                                env.simulator.base_ang_vel[env_id].detach().cpu().clone(),
-                            "base_position": position.cpu().clone(),
-                            "ground_truth_raw": raw_truth[env_id],
-                            "ground_truth": canonical_truth[env_id],
-                            "current_segment_index": segment,
-                            "current_segment": sequence[segment],
-                            "next_segment": next_segment,
-                            "boundary_x_m": boundary_x,
-                            "terrain_length_m": float(env_cfg.terrain.terrain_length),
-                        })
                     record = {
                         "step": steps_run, "env_id": env_id,
+                        "episode_id": f"{env_id}:{quota.episode[env_id]}",
+                        "episode_index": quota.episode[env_id], "reset_control_step": episode_reset_step[env_id],
+                        "reset_boundary": int(inst_total[env_id]) == 1,
+                        "timestamp_s": steps_run*float(env.dt),
                         "track_id": int(track_ids[env_id].item()),
                         "raw_ground_truth": raw_truth[env_id],
                         "canonical_ground_truth": canonical_truth[env_id],
@@ -1213,6 +1205,8 @@ def run_eval(args):
                 for output_record in classifier_outputs:
                     batch_index = output_record["batch_index"]
                     env_id, truth = output_record["env_id"], output_record["truth"]
+                    if not eligible[env_id]:
+                        continue
                     probability = output_record["probability"]
                     instant_label = output_record["instant_label"]
                     posterior, bayes_label = output_record["posterior"], output_record["bayes_label"]
@@ -1238,6 +1232,10 @@ def run_eval(args):
                         pending_transition[env_id] = None
                     record = {
                         "step": steps_run, "env_id": env_id,
+                        "episode_id": f"{env_id}:{quota.episode[env_id]}",
+                        "episode_index": quota.episode[env_id], "reset_control_step": episode_reset_step[env_id],
+                        "reset_boundary": int(inst_total[env_id]) == 1,
+                        "timestamp_s": steps_run*float(env.dt),
                         "track_id": int(track_ids[env_id].item()),
                         "raw_ground_truth": raw_truth[env_id],
                         "canonical_ground_truth": truth,
@@ -1313,6 +1311,46 @@ def run_eval(args):
                         batch1_policy_elapsed_ms + batch1_total)
             classification_updates_seen += 1
 
+            # Accounting/capture is outside all inference timers. Invalid input
+            # holds router state; auto-reset terminal observations are not spliced
+            # into the preceding episode. Its terminal event is recorded below.
+            if paper_method and paper_method != "distilled":
+                input_valid = input_validity(depth, env.simulator._base_euler, env.simulator.base_ang_vel)
+                for env_id in range(env.num_envs):
+                    if not eligible[env_id] or env_id in done_ids:
+                        continue
+                    track_id = int(track_ids[env_id])
+                    segment = min(max(int(float(step_positions[env_id, 0]) / env_cfg.terrain.terrain_length),0),4)
+                    sequence = args.track_layout[track_id]["sequence"]
+                    snap = lambda tensor: tensor[env_id].detach().cpu().clone()
+                    age = getattr(env, "depth_sensor_delayed_frames", None)
+                    age_steps = int(age[env_id]) if age is not None and len(age) == env.num_envs else None
+                    episode_replay[env_id].append({
+                        "episode_id": f"{env_id}:{quota.episode[env_id]}", "episode_index": quota.episode[env_id],
+                        "reset_control_step": episode_reset_step[env_id],
+                        "reset_boundary": not episode_replay[env_id],
+                        "environment_id": env_id, "track_id": track_id,
+                        "source_method": paper_method, "evaluation_seed": args.seed,
+                        "classifier_seed": getattr(args,"classifier_seed",None),
+                        "control_step": steps_run, "timestamp_s": steps_run*float(env.dt),
+                        "depth": snap(depth), "orientation_rpy": snap(env.simulator._base_euler),
+                        "angular_velocity": snap(env.simulator.base_ang_vel),
+                        "base_position": snap(env.simulator.base_pos), "base_quaternion": snap(env.simulator.base_quat),
+                        "base_velocity": snap(env.simulator.base_lin_vel), "commands": snap(env.commands),
+                        "depth_valid": bool(_depth_valid(depth[env_id:env_id+1])[0]),
+                        "input_valid": bool(input_valid[env_id]), "selected_skill": selected_skills[env_id],
+                        "depth_age_s": None if age_steps is None else age_steps*float(env.dt),
+                        "depth_frame_id": None, "depth_acquisition_step": None,
+                        "unavailable_fields": ["depth_frame_id", "depth_acquisition_step"] +
+                            (["depth_age_s"] if age_steps is None else []),
+                        "depth_age_basis": "held buffer delay index (not hardware acquisition timestamp)" if age_steps is not None else "unavailable",
+                        "ground_truth_raw": raw_truth[env_id], "ground_truth": canonical_truth[env_id],
+                        "current_segment_index": segment, "current_segment": sequence[segment],
+                        "next_segment": sequence[segment+1] if segment < 4 else None,
+                        "boundary_x_m": (segment+1)*float(env_cfg.terrain.terrain_length) if segment < 4 else None,
+                        "terrain_length_m": float(env_cfg.terrain.terrain_length),
+                    })
+
         completed_ids = sorted(done_ids | course_ids | lateral_ids)
         manual_reset_ids = []
         for env_id in completed_ids:
@@ -1329,8 +1367,21 @@ def run_eval(args):
                 success, reason = False, "left_column"
             else:
                 success, reason = False, "termination"
-            if completed_by_track[track_id] < args.episodes_per_track:
+            if eligible[env_id]:
+                trace = episode_control_traces[env_id]
+                events = boundary_events([p for t,p in trace], [t for t,p in trace],
+                    args.track_layout[track_id]["sequence"], float(env_cfg.terrain.terrain_length), reason, canonicalize_label)
+                for record in episode_replay[env_id]:
+                    record.update(terminal_outcome=reason, episode_success=success,
+                                  terminal_control_step=steps_run, terminal_position_m=float(step_positions[env_id,0]),
+                                  transition_events=events)
+                trajectory_replay[track_id].extend(episode_replay[env_id])
                 episode_rows.append({
+                    "episode_id": f"{env_id}:{quota.episode[env_id]}", "environment_id": env_id,
+                    "episode_index": quota.episode[env_id], "reset_control_step": episode_reset_step[env_id],
+                    "terminal_control_step": steps_run, "transition_events": events,
+                    "transition_delay_samples": list(episode_delays[env_id]),
+                    "selected_correct": int(selected_correct[env_id]), "selected_total": int(selected_total[env_id]),
                     "paper_method": paper_method, "selector_mode": selector_mode,
                     "classifier_approach": approach,
                     "bayes_filter_approach": "fixed_persistent" if selector_mode == "bayes" else None,
@@ -1351,6 +1402,7 @@ def run_eval(args):
                     "bayes_total": int(bayes_total[env_id].item()),
                     "wrong_skill_fraction": (None if paper_method == "distilled" else
                         0.0 if selector_mode == "oracle" else
+                        None if not int(selected_total[env_id].item()) else
                         1.0 - float(selected_correct[env_id].item()) /
                         max(int(selected_total[env_id].item()), 1)),
                     "skill_switch_count": int(episode_switches[env_id].item()),
@@ -1360,6 +1412,10 @@ def run_eval(args):
                         float(np.mean(episode_delays[env_id])) if episode_delays[env_id] else None),
                 })
                 completed_by_track[track_id] += 1
+            quota.reset(env_id)
+            episode_reset_step[env_id] = steps_run
+            episode_replay[env_id] = []
+            episode_control_traces[env_id] = []
             if env_id not in done_ids:
                 manual_reset_ids.append(env_id)
 
@@ -1392,6 +1448,8 @@ def run_eval(args):
             )
             reset_tensor = torch.tensor(completed_ids, device=device, dtype=torch.long)
             start_x[reset_tensor] = env.simulator.base_pos[reset_tensor, 0]
+            for env_id in completed_ids:
+                episode_control_traces[env_id] = [(steps_run*float(env.dt),float(start_x[env_id]))]
             max_progress[reset_tensor] = 0.0
             episode_steps[reset_tensor] = 0
             inst_correct[reset_tensor] = 0
@@ -1402,7 +1460,31 @@ def run_eval(args):
             selected_total[reset_tensor] = 0
             episode_switches[reset_tensor] = 0
 
+    # Headline recognition is classification-tick weighted over completed,
+    # quota-eligible episodes only. Censored trajectories remain available below.
+    completed_episode_ids = {row["episode_id"] for row in episode_rows}
+    classification.ticks = [r for r in classification.ticks if r["episode_id"] in completed_episode_ids]
+    audited = ClassificationStats()
+    for r in classification.ticks:
+        audited.update(r["canonical_ground_truth"], r["instantaneous_label"], r["bayes_label"], r["selected_skill"], r)
+    audited.switch_count = sum(r["skill_switch_count"] for r in episode_rows)
+    audited.delays = [d for r in episode_rows for d in r.get("transition_delay_samples", [])]
+    classification = audited
     classification_summary = classification.summary()
+    assert classification_summary["selected_skill_total"] == sum(r["selected_total"] for r in episode_rows)
+    assert sum(sum(row) for row in classification_summary["instantaneous"]["confusion_matrix"]) == sum(r["instantaneous_total"] for r in episode_rows)
+    assert classification_summary["instantaneous"]["support"] == {
+        label:sum(r["canonical_ground_truth"]==label for r in classification.ticks) for label in CANONICAL_CLASSES}
+    for env_id, records in enumerate(episode_replay):
+        if records and quota.active[env_id]:
+            trace = episode_control_traces[env_id]
+            track = int(track_ids[env_id])
+            events = boundary_events([p for t,p in trace], [t for t,p in trace], args.track_layout[track]["sequence"],
+                                     float(env_cfg.terrain.terrain_length), "step_cap", canonicalize_label)
+            for record in records:
+                record.update(terminal_outcome="step_cap", episode_success=None,
+                              terminal_control_step=steps_run, terminal_position_m=trace[-1][1], transition_events=events)
+            trajectory_replay[track].extend(records)
     overall = _summary_rows(episode_rows)
     overall.update({
         "quotas_complete": all(value == args.episodes_per_track for value in completed_by_track),
@@ -1616,7 +1698,13 @@ def run_eval(args):
             "statistics": timing_statistics,
             "stage_fractions": stage_fractions,
         },
-        "_trajectory_replay": dict(trajectory_replay) if paper_method == "oracle" else None,
+        "_trajectory_replay": dict(trajectory_replay) if paper_method != "distilled" else None,
+        "diagnostic_accounting": {"version": DIAGNOSTIC_VERSION,
+            "recognition_aggregation": "classification-tick weighted, completed quota-eligible episodes",
+            "success_distance_aggregation": "episode weighted, completed quota-eligible episodes",
+            "censored_trajectories": "saved with step_cap; excluded from headline episode metrics",
+            "reset_observation_rule": "skip auto-reset terminal classification; terminal state captured before reset",
+            "input_validity": "finite nonzero depth and finite orientation/angular velocity; invalid holds filter state"},
         "episodes": episode_rows,
     }
 
@@ -1632,7 +1720,7 @@ def save_results(payload, out_dir, task, result_name=None):
         replay_root = root / f"{stem}_trajectory_replay"
         replay_root.mkdir(parents=True, exist_ok=True)
         replay_files = []
-        tensor_keys = ("depth", "orientation_rpy", "angular_velocity", "base_position")
+        tensor_keys = ("depth", "orientation_rpy", "angular_velocity", "base_position", "base_quaternion", "base_velocity", "commands")
         for track_id, records in sorted(replay_records.items()):
             if not records:
                 continue
@@ -1642,6 +1730,9 @@ def save_results(payload, out_dir, task, result_name=None):
             for key in records[0]:
                 if key not in tensor_keys:
                     packed[key] = [record[key] for record in records]
+            packed["run_id"] = [str(json_path.resolve())]*len(records)
+            packed["diagnostic_version"] = DIAGNOSTIC_VERSION
+            packed["metadata"] = payload["metadata"]
             path = replay_root / f"track_{int(track_id):02d}.pt"
             torch.save(packed, path)
             replay_files.append({
@@ -1658,6 +1749,10 @@ def save_results(payload, out_dir, task, result_name=None):
     with csv_path.open("w", newline="") as stream:
         if rows:
             csv_rows = [{**row, "terrain_sequence": "|".join(row["terrain_sequence"])} for row in rows]
+            for row in csv_rows:
+                for key in ("transition_events", "transition_delay_samples"):
+                    if key in row:
+                        row[key] = json.dumps(row[key])
             writer = csv.DictWriter(stream, fieldnames=list(csv_rows[0]))
             writer.writeheader()
             writer.writerows(csv_rows)
