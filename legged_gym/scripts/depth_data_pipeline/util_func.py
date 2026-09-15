@@ -294,11 +294,19 @@ def evaluate_bayes_from_scores(
     return evaluate_predictions(truth, predictions, ordered_labels, sequence_ids=sequence_ids).as_dict()
 
 
-def sequence_ids_for(data: Mapping[str, Any]) -> torch.Tensor:
+def sequence_ids_for(data: Mapping[str, Any], *, allow_legacy: bool = False) -> torch.Tensor:
+    from legged_gym.utils.dataset_provenance import validate_dataset_provenance
+    validate_dataset_provenance(data, allow_legacy)
     if "sequence_ids" in data:
-        return torch.as_tensor(data["sequence_ids"])
-    if "episode_ids" in data:
-        return torch.as_tensor(data["episode_ids"])
+        # Stable integer coding preserves globally-qualified identities for
+        # runners expecting tensors, including merged unequal-length episodes.
+        values = data["sequence_ids"]
+        if torch.is_tensor(values):
+            values = values.tolist()
+        mapping = {value: i for i, value in enumerate(dict.fromkeys(values))}
+        return torch.tensor([mapping[value] for value in values], dtype=torch.long)
+    import warnings
+    warnings.warn("Legacy sequence fallback: per_eps boundaries are unverified; never use as verified provenance")
     per_episode = int(data.get("per_eps", 0))
     n = len(data["labels"])
     if per_episode <= 0:

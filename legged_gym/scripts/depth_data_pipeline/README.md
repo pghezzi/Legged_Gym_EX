@@ -148,6 +148,142 @@ the selected Bayes and EMA baseline parameters.
 
 ## Frozen offline paper Experiments 1--2
 
+### Docker launcher (persistent shared outputs)
+
+Locomotion/all runs snapshot `legged_gym` and `rsl_rl` into the output directory
+before launching: edits to the working tree cannot break later sweep subprocesses.
+An environment/config import preflight runs before simulation. To resume an interrupted
+locomotion sweep, repeat its launcher command with the same `--run-id` and `--resume`.
+Keep the original difficulty settings and input artifacts; completed valid conditions
+are skipped, missing ones run, and aggregation/replay follows automatically. Resume
+uses a fresh source snapshot and appends console logs. Do not use `--force` unless
+you intend to rerun completed conditions.
+
+From the repository root, use Bash (no TTY required). This reuses the
+`leggedgym-ex:isaacgym` image/venv and mounts source subdirectories, not the
+workspace containing `.venv`. Inputs are mounted read-only. Every invocation
+creates a **new** run; an existing `--run-id` is rejected to protect old results.
+
+```bash
+# Offline training/evaluation only; already-compiled datasets required.
+bash legged_gym/scripts/run_paper_experiments_docker.sh offline \
+  --classifier-data /data/compiled/structural --ordered-data /data/compiled/ordered \
+  --output-root /data/paper_runs --run-id offline_v1 --gpu 0
+
+# Locomotion using a completed offline run (no classifier retraining).
+bash legged_gym/scripts/run_paper_experiments_docker.sh locomotion \
+  --paper-offline-dir /data/paper_runs/offline_v1/offline \
+  --jit /models/specialists.pt --distilled-jit /models/distilled.pt \
+  --output-root /data/paper_runs --run-id locomotion_v1
+
+# Offline first, then headless locomotion using its new classifiers.
+bash legged_gym/scripts/run_paper_experiments_docker.sh all \
+  --classifier-data /data/compiled/structural --ordered-data /data/compiled/ordered \
+  --jit /models/specialists.pt --distilled-jit /models/distilled.pt \
+  --output-root /data/paper_runs --gpu 1
+
+# Regenerate PNG/PDFs from the self-contained bundle, without datasets/models.
+bash legged_gym/scripts/run_paper_experiments_docker.sh plot-only \
+  --bundle /data/paper_runs/offline_v1/offline/figure_data.pt \
+  --output-root /data/paper_runs --gpu none
+```
+
+Use `--image` to override the image, `--dry-run` to validate paths/show commands
+without creating outputs, and `--help` for all options. Separate passthrough uses
+one token per option, e.g. `--offline-arg --batch-size --offline-arg 128` or
+`--locomotion-arg --eval-seeds --locomotion-arg 101 --locomotion-arg 202`.
+Path/mode overrides must use the wrapper's options; no shell command strings
+are evaluated. Without passthrough, existing experimental defaults are unchanged.
+Host GPU indices are exposed as `cuda:0` inside the single-GPU container.
+
+The launcher prints stage start/end and a heartbeat every 30 seconds showing
+elapsed time and time since the last console output. Set `--progress-interval 10`
+for more frequent updates, or `0` to disable heartbeats. These messages are saved
+in `logs/progress.log`; actual experiment messages remain in `logs/offline.log`
+(or the relevant stage log). A heartbeat means the launcher is still waiting,
+not proof that computation is advancing. Offline phase/model/seed messages and
+figure counts provide actual progress; figures report every 25 PNG/PDF pairs.
+An already-running Python process will not pick up these changes automatically.
+
+All checkpoints, metrics, figures/bundle and replay data persist under
+`<output-root>/<run-id>/offline/` and `locomotion/`. Console/simulator logs live
+in `logs/`; `commands.sh`, `mounts.txt`, `run_metadata.txt`, `git_status.txt`, and
+per-stage/overall `exit_status` files record execution. Container paths are
+`/paper/offline`, `/paper/locomotion`, `/paper/logs` (also the workspace `logs/`).
+Mappings in `mounts.txt` resolve these paths to the host when moving artifacts.
+
+The launcher uses `umask 000` and normalizes only the **new managed run** to
+0777 directories / 0666 files on exit, including failure. Everyone can modify
+these results: use trusted storage with traversable ancestor directories.
+Existing results, inputs, repository permissions and the host environment are
+untouched. Host crashes/SIGKILL or inaccessible Docker may prevent final cleanup;
+cleanup failures are reported. A lightweight Docker-only write/failure check is
+available with `--smoke-test success` or `--smoke-test failure` (exit 23); combine
+with `plot-only --bundle <any-readable-file> --gpu none`. It never runs an
+experiment. Automated checks: `RUN_DOCKER_SMOKE=1 python -m unittest discover
+-s tests -p test_paper_experiments_docker.py` (uses local `ubuntu:20.04`, overridable
+with `PAPER_SMOKE_IMAGE`). No full sweep is needed to test the launcher.
+
+### Automatic training-cost audit and relocated inputs
+
+`offline`, `locomotion`, and `all` now automatically aggregate post-specialist
+training costs into the new run's `costs/` directory. `plot-only` does so only
+when `--paper-offline-dir` is also supplied. No evaluation runtime is used as
+training cost. Missing collection/compilation/training records leave totals
+unavailable, rather than zero. A locomotion failure still permits the independent
+cost audit when offline results exist, while preserving the evaluation exit code.
+
+Add these repeatable options to any applicable launch:
+
+```bash
+  --collection-cost /data/capture.pt.training_cost.json \
+  --compilation-cost /data/compiled/training_cost.json \
+  --distillation-run /models/distill_seed_0 \
+  --distillation-run /models/distill_seed_1 \
+  --distillation-run /models/distill_seed_2 \
+  --deployment-artifact distilled:0 /models/student_seed_0.pt
+```
+
+Aggregate existing runs without training or evaluation:
+
+```bash
+bash legged_gym/scripts/run_paper_experiments_docker.sh cost-only \
+  --paper-offline-dir /data/paper_runs/offline_v1/offline --gpu none \
+  --collection-cost /data/capture.pt.training_cost.json \
+  --compilation-cost /data/compiled/training_cost.json \
+  --path-map /inputs/classifier /data/compiled \
+  --distillation-run /models/distill_seed_0 \
+  --deployment-artifact distilled:0 /models/student_seed_0.pt \
+  --output-root /data/paper_runs --run-id cost_audit_v1
+```
+
+All additional inputs are read-only. `--path-map RECORDED_PREFIX HOST_PATH`
+mounts the current host file/directory and resolves references recorded under an
+old host/container prefix; repeat for other relocated roots. Longest matching
+prefix wins. Current host mounts and the previous `/paper/offline` location are
+mapped automatically. Original manifests/sidecars are never edited. Resolved
+identities deduplicate sources shared by training/calibration; unreferenced
+ordered-test collection is not charged. Mappings are recorded in commands and
+`costs/training_cost_manifest.json`. Raw image files are not needed if their
+linked sidecars/provenance are supplied. Missing optional data stays unavailable.
+
+Deployment accounting adds `deployment_size_mb` (MiB) without replacing the
+historical `artifact_size_mb` training-checkpoint field. Router sizes include
+the frozen loader's manifest, classifier/model arguments, and feature
+extractor/standardizer when applicable. Training optimizer checkpoints and
+pre-existing specialists are not added. Explicit exports can be supplied with
+`--deployment-artifact feature_nn[:SEED]|raw_depth_nn[:SEED]|distilled[:SEED] FILE`;
+repeat for split exports. Unscoped files are explicitly shared by that method's
+runs; use `:0`, `:1`, `:2` for independent seed exports. Locomotion's
+`--distilled-jit` is the shared export reference unless explicit distilled
+artifacts are provided. Missing deployment components make their total
+unavailable. Files are counted once per deployment, not summed across alternatives.
+
+Cost CSV/JSON, LaTeX, and PNG/PDF outputs retain the same universal permissions.
+See `logs/costs.log`, `logs/costs.exit_status`, and `commands.sh`. To test real
+cost-only aggregation on synthetic relocated sidecars (no experiments):
+`RUN_DOCKER_COSTS=1 python -m unittest discover -s tests -p test_paper_experiments_docker.py`.
+
 To train exactly three deterministic seeded copies of the fixed feature/raw-depth
 NNs and evaluate instantaneous, fixed EMA, and fixed persistent-Bayes results
 without running any search:

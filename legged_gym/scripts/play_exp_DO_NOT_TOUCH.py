@@ -13,7 +13,6 @@ from legged_gym.utils.exp_data_logger import ExpLogger
 from legged_gym.utils.terrain_vars import TERRAIN_INDEX, TERRAIN_KEYS
 import argparse
 
-import cv2
 
 from rsl_rl.utils.training_cost import (
     artifact_size_mb,
@@ -22,6 +21,8 @@ from rsl_rl.utils.training_cost import (
     provenance_map,
     reset_peak_memory,
     synchronize,
+    stage_accounting,
+    WallTimer,
     write_cost_record,
 )
 
@@ -280,7 +281,7 @@ def override_configs(env_cfg, args):
         "stairs": {
             "type": "terrain_utils.pyramid_stairs_terrain",
             "step_width": 0.4,
-            "step_height": -0.25,
+            "step_height": -0.30,
             "platform_size": 3.0,
         },
         "upwards_stairs": {
@@ -316,7 +317,7 @@ def override_configs(env_cfg, args):
         },
         "pit": {
             "type": "terrain_utils.pit_terrain",
-            "depth": 0.52,
+            "depth": 0.35,
             "platform_size": 3.0,
         },
         "multiple_high_platforms" : {
@@ -342,6 +343,8 @@ def override_configs(env_cfg, args):
     # number of environments
     env_cfg.env.num_envs = envs
     env_cfg.asset.terminate_after_contacts_on = []
+    if hasattr(env_cfg.rewards, "obstacle_progress"):
+        env_cfg.rewards.obstacle_progress.enabled = False
     if args.explore:
         env_cfg.init_state.yaw_random_scale = np.pi
         env_cfg.commands.ranges.heading = [-3.14, 3.14]
@@ -435,7 +438,7 @@ def override_configs(env_cfg, args):
             env_cfg.terrain.border_size = 0.0
             env_cfg.env.episode_length_s = 120
             env_cfg.terrain.num_rows = 10
-            env_cfg.terrain.num_cols = 4
+            env_cfg.terrain.num_cols = 10
             env_cfg.terrain.platform_size = 3.0
             env_cfg.terrain.curriculum = False
             env_cfg.terrain.selected   = False
@@ -499,13 +502,13 @@ def override_configs(env_cfg, args):
                 if terrain_type == "pit":
                     return {
                         "type": "terrain_utils.pit_terrain",
-                        "depth": rng.uniform(0.2, 0.5),
+                        "depth": rng.uniform(0.2, 0.35),
                         "platform_size": 3.0,
                     }
                 if terrain_type == "central":
                     return {
                         "type": "terrain_utils.center_platform_terrain",
-                        "height": rng.uniform(0.2, 0.5),
+                        "height": rng.uniform(0.2, 0.35),
                         "platform_size": 3.0,
                     }
 
@@ -695,6 +698,32 @@ def print_debug_info(env, robot_index):
     # print(f"ankle pitch: {env.simulator.dof_pos[robot_index, [3,7]].cpu().numpy()}")
     pass
 
+
+def randomize_terrain_on_reset(env):
+    """Randomize terrain patch assignment before each reset in this play script.
+
+    The environment's regular ``reset_idx`` then places each robot at the new
+    origin.  This deliberately lives here, rather than in ``LeggedRobot``, so
+    training and every other play entry point retain their existing behavior.
+    """
+    original_reset_idx = env.reset_idx
+
+    def reset_idx_with_random_terrain(env_ids):
+        simulator = env.simulator
+        if env_ids.numel() and simulator.custom_origins:
+            terrain_origins = simulator._terrain_origins
+            levels, terrain_types = terrain_origins.shape[:2]
+            simulator._terrain_levels[env_ids] = torch.randint(
+                levels, (env_ids.numel(),), device=env_ids.device)
+            simulator._terrain_types[env_ids] = torch.randint(
+                terrain_types, (env_ids.numel(),), device=env_ids.device)
+            simulator._env_origins[env_ids] = terrain_origins[
+                simulator._terrain_levels[env_ids], simulator._terrain_types[env_ids]]
+        return original_reset_idx(env_ids)
+
+    env.reset_idx = reset_idx_with_random_terrain
+
+
 def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
     """Run interaction loop between environment and policy
 
@@ -703,12 +732,15 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         policy : a policy that takes observations and outputs actions
         args: command line arguments
     """
+    if not args.no_depth_cam:
+        import cv2  # Optional: headless depth collection does not need a preview window.
     
     robot_index = 0 # which robot is used for logging
     joint_index = 2 # which joint is used for logging
     stop_state_log = 300 # number of steps before plotting states
     stop_rew_log = env.max_episode_length + 1 # number of steps before print average episode rewards
 
+    randomize_terrain_on_reset(env)
     env.reset()
 
     # logger = ExpLogger(train_cfg.runner.exp_data_path)
@@ -739,6 +771,8 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
 
     if args.save_depth_classifier_data:
         depth_images_log = []
+        from legged_gym.utils.dataset_provenance import CaptureProvenance
+        capture_provenance = CaptureProvenance(env.num_envs, env.device)
         base_rpy_log = []
         base_ang_vel_log = []
         resets_log = []
@@ -847,9 +881,19 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
     commands[:, 3] = cho[torch.randint(0, cho.shape[0], (env.num_envs,))]
     if args.save_depth_classifier_data:
         print(f"Num of samples generated: {(10* 1000 * env.num_envs) / 5} (aprox)")
-        reset_peak_memory(env.device)
-        collection_total_started = time.perf_counter()
-        collection_started = collection_total_started
+        synchronize(env.device)
+        collection_total_started = args._collection_total_started
+        collection_started = time.perf_counter()
+        collection_setup_s = collection_started - collection_total_started
+    if args.save_depth_classifier_data:
+        # Observe every actual reset, including manual resets AFTER a capture
+        # and simulator episode resets on intervening non-camera control ticks.
+        original_reset_idx = env.reset_idx
+        def tracked_reset_idx(env_ids):
+            result = original_reset_idx(env_ids)
+            capture_provenance.reset(env_ids)
+            return result
+        env.reset_idx = tracked_reset_idx
     #(10* 1000 * 100) / 5 = 2000
     for i in range(int(10.00*env.max_episode_length)):
         if not args.headless and args.follow_robot:
@@ -905,17 +949,18 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         #    k = 0.5
         #    desired_heading = k*torch.atan2(dy, dx)
         #    env.commands[:, 3] = desired_heading
-        if args.jit:
-            import time
-            with lock:
-                if requested_mode is not None:
-                    if requested_mode < policy.num_of_loras:
-                        policy.swap(requested_mode)
-                        start = time.perf_counter()
-                        policy_tester.swap(requested_mode)
-                        end = time.perf_counter()
-                        print(f"Time: {end - start} seconds")
-                        requested_mode = None
+        
+        #if args.jit:
+        #    
+        #    with lock:
+        #        if requested_mode is not None:
+        #            if requested_mode < policy.num_of_loras:
+        #                policy.swap(requested_mode)
+        #                start = time.perf_counter()
+        #                policy_tester.swap(requested_mode)
+        #                end = time.perf_counter()
+        #                print(f"Time: {end - start} seconds")
+        #                requested_mode = None
 
 
         #if arg.test_terrain not in ("plane", "baseline") and args.save_depth_classifier_data:
@@ -963,6 +1008,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
                     break
             if i % 5 == 0: # this assumes a 50hz policy so that we actually run at 10. If change, change this
                 if args.save_depth_classifier_data:
+                    capture_provenance.capture(i + 1)  # post-step observation
                     depth_images_log.append(env.depth_sensor_output.detach().cpu().clone())
                     base_rpy_log.append(env.simulator._base_euler.detach().cpu().clone())
                     base_ang_vel_log.append(env.simulator.base_ang_vel.detach().cpu().clone())
@@ -1028,11 +1074,19 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
                 env.reset_idx(env_ids)
 
         if i % 5 == 0 and args.save_depth_classifier_data and args.filter_depth_classifier_data:
-            resets_log.append(dones)
+            resets_log.append(dones.detach().cpu().clone())
 
         if args.save_depth_classifier_data:
             executed_control_steps += 1
             completed_episodes += torch.count_nonzero(dones)
+            if executed_control_steps % 10_000 == 0:
+                print(
+                    f"[Collection] {executed_control_steps:,}/"
+                    f"{int(10.00 * env.max_episode_length):,} control timesteps collected "
+                    f"per environment; {collected_depth_samples:,} depth samples buffered "
+                    f"across {env.num_envs} environments. Saving begins after the run finishes.",
+                    flush=True,
+                )
 
         #if dones[0] == True:
         #    if args.terrain_detector:
@@ -1089,6 +1143,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
     if args.save_depth_classifier_data:
         synchronize(env.device)
         collection_wallclock_s = time.perf_counter() - collection_started
+        env.reset_idx = original_reset_idx
     if "depth_waq" in task_name and not args.no_depth_cam:
         cv2.destroyAllWindows()
     
@@ -1137,6 +1192,8 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
         return tuple(shape)
     
     if args.save_depth_classifier_data:
+        preprocessing_timer = WallTimer(env.device).start()
+        observation_provenance = capture_provenance.export()
         print("compiling")
         depth_images_tensor = torch.stack(depth_images_log, dim=0).squeeze(2)
         del depth_images_log
@@ -1151,7 +1208,9 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             labels_tensor = None
         print("splitting")
         if args.filter_depth_classifier_data:
-            reset_tensor = torch.stack(resets_log, dim=0)
+            episodes = observation_provenance["episode_ids"]
+            reset_tensor = torch.zeros_like(episodes, dtype=torch.bool)
+            reset_tensor[1:] = episodes[1:] != episodes[:-1]
             print(depth_images_tensor.shape)
             depth_images_tensor = reset_split(depth_images_tensor, reset_tensor)   # [T, num_envs, H, W] (or however depth is shaped)
             print(depth_images_tensor.shape)
@@ -1159,6 +1218,9 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             base_ang_vel_tensor = reset_split(base_ang_vel_tensor, reset_tensor)
             if labels_tensor is not None:
                 labels_tensor = reset_split(labels_tensor, reset_tensor)
+            from legged_gym.utils.dataset_provenance import FRAME_FIELDS
+            for key in FRAME_FIELDS:
+                observation_provenance[key] = reset_split(observation_provenance[key], reset_tensor)
         if labels_tensor is not None:
             labels_tensor = tensor_to_keys(labels_tensor)
         if args.multitask:
@@ -1195,6 +1257,8 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
                 for _ in range(depth_images_tensor.shape[0])
             ]
 
+        collection_preprocessing_s = preprocessing_timer.stop()
+        serialization_timer = WallTimer(env.device).start()
         print("Saving file")
 
         torch.save({
@@ -1205,9 +1269,11 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             "base_ang_vel": base_ang_vel_tensor,
             "base_ang_vel_shape": tuple(base_ang_vel_tensor.shape),
             "terrain_name": labels_list,
-            "filtered": args.filter_depth_classifier_data
+            "filtered": args.filter_depth_classifier_data,
+            "provenance": observation_provenance,
         }, save_path)
 
+        serialization_s = serialization_timer.stop()
         synchronize(env.device)
         total_wallclock_s = time.perf_counter() - collection_total_started
         completed_episode_count = int(completed_episodes.item())
@@ -1241,7 +1307,7 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             "control_frequency_hz": control_frequency_hz,
             "simulation_frequency_hz": simulation_frequency_hz,
             "data_generation_s": collection_wallclock_s,
-            "preprocessing_s": 0.0,
+            "preprocessing_s": collection_preprocessing_s,
             "optimization_s": 0.0,
             "total_wallclock_s": total_wallclock_s,
             "gpu_active_time_s": None,
@@ -1250,12 +1316,16 @@ def interaction_loop(train_cfg, env, policy, args, new="", policy1=None):
             "trainable_params": 0,
             **device_info,
             "notes": [
-                "Accounting starts immediately before the unchanged interaction loop and ends after dataset serialization.",
+                "Accounting starts before environment/specialist construction and ends after dataset serialization; setup includes loading, rollout includes online capture/filtering, preprocessing is post-rollout stacking/filtering.",
                 "Environment steps count vectorized control transitions; simulator_substeps additionally applies control decimation.",
                 "GPU-hours are synchronized allocated-device wall-clock; kernel-active time requires an external profiler.",
                 "Specialist-policy training is excluded.",
             ],
         }
+        cost_record.update(stage_accounting(
+            total_wallclock_s, device_info["gpu_count"], setup_s=collection_setup_s,
+            data_generation_s=collection_wallclock_s, preprocessing_s=collection_preprocessing_s,
+            artifact_serialization_s=serialization_s))
         cost_record["metric_status"] = provenance_map(cost_record)
         cost_record["metric_status"]["gpu_active_time_s"] = "unavailable"
         cost_record["metric_status"]["gpu_hours"] = (
@@ -1538,6 +1608,11 @@ def play(args):
     Args:
         args (_type_): command line arguments
     """
+    if args.save_depth_classifier_data:
+        cost_device = "cpu" if args.cpu else args.gpu
+        reset_peak_memory(cost_device)
+        synchronize(cost_device)
+        args._collection_total_started = time.perf_counter()
     if "genesis" in SIMULATOR:
         init_genesis(args, gs)
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
@@ -1557,7 +1632,7 @@ def play(args):
     policy1 = None
     
     if args.jit:
-        policy1 = policy
+        #policy1 = policy
         policy = torch.jit.load(args.jit,  map_location=args.gpu if not args.cpu else 'cpu')
         if hasattr(policy, 'swap'):
             policy = multi_jit(policy, TERRAIN_KEYS)

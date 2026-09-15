@@ -17,6 +17,8 @@ done
 
 viewer_repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$viewer_repo"
+# Persist collection datasets and their timing sidecars outside --rm containers.
+mkdir -p "$viewer_repo/depth_waq_selector"
 viewer_gpu=${VIEWER_GPU:-1}
 case "$viewer_gpu" in
   ''|*[!0-9]*) echo "VIEWER_GPU must be a host GPU index, such as 0 or 1." >&2; exit 1 ;;
@@ -74,6 +76,7 @@ docker run --rm -it \
   -v "$viewer_repo/legged_gym:/workspace/LeggedGym-Ex/legged_gym" \
   -v "$viewer_repo/rsl_rl:/workspace/LeggedGym-Ex/rsl_rl" \
   -v "$viewer_repo/logs:/workspace/LeggedGym-Ex/logs" \
+  -v "$viewer_repo/depth_waq_selector:/workspace/LeggedGym-Ex/depth_waq_selector" \
   -w /workspace/LeggedGym-Ex \
   leggedgym-ex:isaacgym \
   bash -c '

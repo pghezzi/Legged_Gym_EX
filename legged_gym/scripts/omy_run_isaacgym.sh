@@ -4,6 +4,7 @@ set -eu
 # Resolve the repository relative to this script, on any host machine.
 script_repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$script_repo"
+mkdir -p "$script_repo/depth_waq_selector"
 
 training_gpu=${TRAIN_GPU:-0}
 case "$training_gpu" in
@@ -19,6 +20,7 @@ docker run --rm -it \
   -v "$PWD/legged_gym:/workspace/LeggedGym-Ex/legged_gym" \
   -v "$PWD/rsl_rl:/workspace/LeggedGym-Ex/rsl_rl" \
   -v "$PWD/logs:/workspace/LeggedGym-Ex/logs" \
+  -v "$PWD/depth_waq_selector:/workspace/LeggedGym-Ex/depth_waq_selector" \
   -w /workspace/LeggedGym-Ex \
   leggedgym-ex:isaacgym \
   bash -c '

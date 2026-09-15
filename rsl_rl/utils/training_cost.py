@@ -12,6 +12,30 @@ import torch
 
 
 PROVENANCE_STATES = ("measured", "reconstructed", "unavailable")
+STAGE_FIELDS = ("setup_s", "data_generation_s", "preprocessing_s", "optimization_s",
+                "artifact_serialization_s", "overhead_s")
+
+
+def stage_accounting(total_s: float, gpu_count: int, *, setup_s=0.0,
+                     data_generation_s=0.0, preprocessing_s=0.0,
+                     optimization_s=0.0, artifact_serialization_s=0.0) -> dict[str, Any]:
+    """Disjoint stages; residual overhead closes the accounted wall-clock boundary.
+
+    Setup includes construction/loading; preprocessing excludes rollout and fit.
+    Serialization includes output artifacts, excluding the accounting sidecar itself.
+    More detailed loading/splitting/merging fields are subdivisions, never extra
+    additive stages. GPU-hours charge allocated devices throughout this boundary,
+    including CPU work and I/O, and do not estimate GPU-active time.
+    """
+    stages = dict(setup_s=setup_s, data_generation_s=data_generation_s,
+                  preprocessing_s=preprocessing_s, optimization_s=optimization_s,
+                  artifact_serialization_s=artifact_serialization_s)
+    remaining = total_s - sum(stages.values())
+    if remaining < -1e-6 or any(value < 0 for value in stages.values()):
+        raise ValueError("Timing stages overlap or exceed accounted total")
+    return {**stages, "overhead_s": max(0.0, remaining),
+            "total_wallclock_s": total_s, "gpu_hours": total_s * gpu_count / 3600.0,
+            "gpu_active_time_s": None, "timing_schema_version": 2}
 
 
 def cuda_device_info(device: Any) -> dict[str, Any]:

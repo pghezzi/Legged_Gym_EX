@@ -25,6 +25,7 @@ from legged_gym.utils.depth_terrain_classifier.terrain_classifier_bayes_streamin
     BayesianTerrainFilter,
     estimate_observation_matrix_from_probabilities,
     evaluate_predictions,
+    evaluate_transition_accounting,
     make_persistent_transition_matrix,
     run_filter_sequences,
 )
@@ -722,6 +723,7 @@ def _ambiguity_run_length(mask: torch.Tensor, sequence_ids: Sequence) -> float:
 def evaluate_sequential_predictions(
     truth: Sequence, predictions: Sequence, labels: Sequence, sequence_ids: Sequence,
     metric_config: Mapping[str, float] = SEQUENTIAL_METRIC_CONFIG,
+    *, transition_accounting_v2: bool = False,
 ) -> dict[str, Any]:
     truth, predictions, labels, ids = list(truth), list(predictions), list(labels), list(sequence_ids)
     base = evaluate_predictions(truth, predictions, labels, sequence_ids=ids)
@@ -762,6 +764,7 @@ def evaluate_sequential_predictions(
         "per_class_recall": recalls, "per_class_precision": precisions,
         "minimum_class_recall": min(recalls.values()) if recalls else float("nan"),
         "missing_predicted_classes": missing, "confusion_matrix": matrix,
+        **(evaluate_transition_accounting(truth, predictions, ids) if transition_accounting_v2 else {}),
     }
 
 

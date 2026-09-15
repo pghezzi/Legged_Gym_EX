@@ -283,16 +283,13 @@ def test_integration_calls_existing_rewards_then_unscaled_bonus_before_reset():
     exec(compile(ast.fix_missing_locations(ast.Module(body=[replacement], type_ignores=[])), str(path), "exec"), namespace)
     obj = namespace["Subject"]()
     obj._update_feet_air_time = lambda: None
-    obj._reward_feet_prolonged_air_time = lambda: torch.zeros(1)
-    obj.episode_sums = {"feet_prolonged_air_time": torch.zeros(1)}
     obj.obstacle_progress = SimpleNamespace(advance=lambda failed: (torch.tensor([.2]), torch.tensor([.3])),
                                            state=SimpleNamespace(stationary_penalty=torch.tensor([-.1])))
     obj.gap_reset_buf = torch.tensor([False])
     obj.fail_buf = torch.zeros(1)
     obj.terminated_bodies_force_norm = torch.zeros(1, 1)
     obj.simulator = SimpleNamespace(projected_gravity=torch.tensor([[0., 0., -1.]]))
-    obj.cfg = SimpleNamespace(env=SimpleNamespace(fail_to_terminal_time_s=1., max_projected_gravity=-.5),
-                              rewards=SimpleNamespace(feet_prolonged_air_time_penalty_rate=1.))
+    obj.cfg = SimpleNamespace(env=SimpleNamespace(fail_to_terminal_time_s=1., max_projected_gravity=-.5))
     obj.dt = .02
     obj.compute_reward()
     assert obj.rew_buf.item() == pytest.approx(1.1)

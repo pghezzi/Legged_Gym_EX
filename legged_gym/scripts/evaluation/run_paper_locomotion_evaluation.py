@@ -171,12 +171,14 @@ def _run_conditions(args):
                         with result_path.open(encoding="utf-8") as stream:
                             existing = json.load(stream)
                         latency_samples = existing.get("latency", {}).get("samples", {})
-                        replay_ready = (method != "oracle" or
+                        replay_ready = (method == "distilled" or
                                         bool((existing.get("trajectory_replay") or {}).get("files")))
+                        replay_ready = replay_ready and existing.get("diagnostic_accounting", {}).get("version") == "eligible_episode_segment_v2"
                         if (existing.get("overall", {}).get("quotas_complete")
                                 and latency_samples.get("total_inference_ms_per_control_step")
                                 and latency_samples.get("batch1_deployment_latency_ms")
                                 and replay_ready):
+                            print(f"Skipping completed condition: {result_path}", flush=True)
                             results.append(result_path)
                             continue
                     if args.aggregate_only:
@@ -252,6 +254,7 @@ def _rows(payloads):
         method = metadata["paper_method"]
         common = {
             "method": method, "method_label": METHOD_LABELS[method],
+            "diagnostic_metric_version": payload.get("diagnostic_accounting", {}).get("version", "legacy_unverified"),
             "difficulty_level": metadata["difficulty_level"],
             "evaluation_seed": metadata["seed"],
             "classifier_seed": metadata.get("classifier_seed"),
@@ -431,6 +434,27 @@ def _offline_replay_baselines(offline_dir, selected_seeds):
 
 
 def _run_trajectory_replay(args, payloads):
+    """Versioned shared oracle/learned-trajectory diagnostics; no tuning."""
+    import torch
+    from legged_gym.scripts.evaluation.high_level_evaluation import (
+        _load_paper_classifier, _make_paper_bayes_filters, canonicalize_label,
+    )
+    from legged_gym.scripts.depth_data_pipeline.sequential_terrain_filter_extensions import EMALogitPatienceFilter
+    from legged_gym.scripts.evaluation.locomotion_replay import run_replay
+    gpu = str(args.gpu)
+    device = torch.device("cpu" if args.cpu else f"cuda:{gpu}" if gpu.isdigit() else gpu)
+    runtimes = {}
+    for arch in ("feature_nn", "raw_depth_nn"):
+        runtime, _, manifest = _load_paper_classifier(args.paper_offline_dir, arch,
+            args.selected_classifier_seeds[arch], device)
+        runtimes[arch] = (runtime, manifest)
+    predictions, transitions, accuracy = run_replay(args, payloads, runtimes,
+        _make_paper_bayes_filters, EMALogitPatienceFilter, canonicalize_label, _balanced_accuracy,
+        _offline_replay_baselines(args.paper_offline_dir, args.selected_classifier_seeds))
+    return predictions, transitions, _summarize_transition_replay(transitions), accuracy
+
+
+def _run_trajectory_replay_legacy(args, payloads):
     """Replay oracle observations through both frozen perception pipelines."""
     import torch
     from legged_gym.scripts.evaluation.high_level_evaluation import (
@@ -704,16 +728,23 @@ def _summarize_transition_replay(rows):
                  ("architecture", "temporal_method", "transition_pair"),
                  ("architecture", "temporal_method", "difficulty_level", "transition_pair"))
     for keys in groupings:
+        if rows and "source_method" in rows[0]:
+            keys = ("source_method",) + keys
         groups = defaultdict(list)
         for row in rows:
             groups[tuple(row[key] for key in keys)].append(row)
         for group, members in groups.items():
             record = dict(zip(keys, group))
-            record["scope"] = "+".join(key.replace("_level", "") for key in keys[2:]) or "overall"
+            record["scope"] = "+".join(key.replace("_level", "") for key in keys if key in ("difficulty_level","transition_pair")) or "overall"
             record["num_boundaries"] = len(members)
             valid = [row for row in members if row["skill_change_required"]]
             record["num_skill_change_boundaries"] = len(valid)
+            if any("metric_version" in row for row in valid):
+                record["metric_version"] = "eligible_episode_segment_v2"
+                record["matched_segment_count"] = sum(row.get("first_match_index") is not None for row in valid)
+                record["missed_segment_count"] = sum(row.get("missed_transition") is True for row in valid)
             for metric in ("delta_t_switch_s", "switch_distance_offset_m",
+                           "first_match_delay_ticks",
                            "transition_window_accuracy", "pre_transition_wrong_skill_occupancy",
                            "pre_transition_upcoming_skill_occupancy",
                            "post_transition_wrong_skill_occupancy",
@@ -723,8 +754,12 @@ def _summarize_transition_replay(rows):
                 for statistic in ("mean", "std", "median", "p95"):
                     record[f"{metric}_{statistic}"] = stats[statistic]
             for metric in ("missed_transition", "late_transition", "premature_transition"):
-                record[f"{metric}_rate"] = (float(np.mean([row[metric] for row in valid]))
-                                              if valid else None)
+                measured = [row[metric] for row in valid if row.get(metric) is not None]
+                record[f"{metric}_rate"] = float(np.mean(measured)) if measured else None
+                record[f"{metric}_denominator"] = len(measured)
+            record["censored_count"] = sum(bool(r.get("observation_censored")) for r in valid)
+            record["unreached_count"] = sum(r.get("recognition_status") == "unreached" for r in valid)
+            record["transient_early_count"] = sum(len(r.get("transient_early_runs", [])) for r in valid)
             output.append(record)
     return output
 
@@ -738,17 +773,29 @@ def _transition_pair_rows(per_episode):
         canonical = ["rough" if value == "random_uniform" else
                      "stairs" if value in ("upwards_stairs", "stairs") else value
                      for value in sequence]
-        for source, target in zip(canonical, canonical[1:]):
-            expanded.append({"method": row["method"],
-                             "difficulty_level": row["difficulty_level"],
-                             "transition_pair": f"{source}->{target}",
-                             "success": float(row["success"])})
+        for pair in sorted(set(f"{s}->{t}" for s,t in zip(canonical,canonical[1:]))):
+            events=row.get("transition_events",[])
+            if isinstance(events,str): events=json.loads(events)
+            observed=[e for e in events if e["transition_pair"]==pair]
+            expanded.append({"method":row["method"],"difficulty_level":row["difficulty_level"],
+                "transition_pair":pair,"episode_success":float(row["success"]),"events":observed})
     groups = defaultdict(list)
     for row in expanded:
-        groups[(row["method"], row["difficulty_level"], row["transition_pair"])].append(row["success"])
-    return [{"method": key[0], "difficulty_level": key[1], "transition_pair": key[2],
-             "episode_count": len(values), "success_rate": float(np.mean(values))}
-            for key, values in sorted(groups.items())]
+        groups[(row["method"], row["difficulty_level"], row["transition_pair"])].append(row)
+    result=[]
+    for key,values in sorted(groups.items()):
+        events=[e for r in values for e in r["events"]]
+        resolved=[e["traversal_success"] for e in events if e["traversal_success"] is not None]
+        result.append(dict(method=key[0],difficulty_level=key[1],transition_pair=key[2],
+            metric_version="eligible_episode_segment_v2",episode_count=len(values),
+            success_rate=float(np.mean([r["episode_success"] for r in values])),
+            success_rate_definition="episode success on courses containing this pair (not transition success)",
+            traversal_success_rate=float(np.mean(resolved)) if resolved else None,
+            resolved_transition_count=len(resolved),observed_crossings=sum(e["crossing_index"] is not None for e in events),
+            failed_approaches=sum(e["traversal_outcome"]=="failed_approach" for e in events),
+            unreached_count=sum(e["traversal_outcome"]=="unreached" for e in events),
+            censored_count=sum("censored" in e["traversal_outcome"] for e in events)))
+    return result
 
 
 def _latex(summary, output):
@@ -883,7 +930,8 @@ def _figures(summary, by_difficulty, latency_summary, payloads, output):
             continue
         groups = defaultdict(list)
         for tick in payload.get("classification_ticks", []):
-            groups[(tick["env_id"], tick["track_id"])].append(tick)
+            if "episode_id" in tick:
+                groups[(tick["env_id"], tick["track_id"], tick["episode_id"])].append(tick)
         for key, ticks in sorted(groups.items()):
             if any(tick["instantaneous_label"] != tick["canonical_ground_truth"]
                    and tick["bayes_label"] == tick["canonical_ground_truth"] for tick in ticks):
@@ -898,13 +946,14 @@ def _figures(summary, by_difficulty, latency_summary, payloads, output):
             payload = sorted(candidates, key=lambda value: value["_path"])[0]
             groups = defaultdict(list)
             for tick in payload.get("classification_ticks", []):
-                groups[(tick["env_id"], tick["track_id"])].append(tick)
+                if "episode_id" in tick:
+                    groups[(tick["env_id"], tick["track_id"], tick["episode_id"])].append(tick)
             if groups:
                 key = sorted(groups)[0]
                 chosen = payload, key, groups[key], "first_available_feature_bayes_rollout"
     timeline_metadata = None
     if chosen:
-        payload, (env_id, track_id), ticks, rule = chosen
+        payload, (env_id, track_id, episode_id), ticks, rule = chosen
         labels = ["rough", "gap", "pit", "stairs"]
         index = {label: value for value, label in enumerate(labels)}
         fig, ax = plt.subplots(figsize=(9.0, 4.5))
@@ -922,11 +971,21 @@ def _figures(summary, by_difficulty, latency_summary, payloads, output):
             fig.savefig(output / f"closed_loop_timeline.{extension}", dpi=300)
         plt.close(fig)
         timeline_metadata = {"selection_rule": rule, "result_path": payload["_path"],
-                             "environment_id": env_id, "track_id": track_id}
+                             "environment_id": env_id, "track_id": track_id,
+                             "episode_id": episode_id}
     return timeline_metadata
 
 
-def _replay_figures(predictions, transitions, transition_summary, accuracy, output):
+def _replay_figures(predictions, transitions, transition_summary, accuracy, output, _stratified=False):
+    if not _stratified and any("source_method" in r for r in predictions):
+        for source in sorted({r["source_method"] for r in predictions}):
+            folder=output/"replay_by_source"/source;folder.mkdir(parents=True,exist_ok=True)
+            _replay_figures(*[[r for r in rows if r.get("source_method")==source]
+                             for rows in (predictions,transitions,transition_summary,accuracy)], folder, True)
+        # Existing filenames retain the oracle-source interpretation.
+        predictions,transitions,transition_summary,accuracy = [
+            [r for r in rows if r.get("source_method")=="oracle"]
+            for rows in (predictions,transitions,transition_summary,accuracy)]
     if not predictions:
         return
     import matplotlib
@@ -936,6 +995,7 @@ def _replay_figures(predictions, transitions, transition_summary, accuracy, outp
     colors = {"feature_nn": "#377eb8", "raw_depth_nn": "#e6550d"}
     display = {"feature_nn": "Feature", "raw_depth_nn": "Raw depth"}
     instant = [row for row in predictions if row["temporal_method"] == "instantaneous"
+               and row.get("input_valid", True)
                and row.get("signed_distance_to_boundary_m") is not None
                and abs(float(row["signed_distance_to_boundary_m"])) <= 2.0]
     fig, ax = plt.subplots(figsize=(6.5, 4.2))
@@ -989,6 +1049,8 @@ def _replay_figures(predictions, transitions, transition_summary, accuracy, outp
     fig, ax = plt.subplots(figsize=(6.2, 4.3))
     markers = {"instantaneous": "o", "ema": "s", "bayes": "^"}
     for row in overall:
+        if row["steady_state_accuracy"] is None or row["transition_window_accuracy"] is None:
+            continue
         ax.scatter(row["steady_state_accuracy"], row["transition_window_accuracy"],
                    color=colors[row["architecture"]], marker=markers[row["temporal_method"]], s=55)
         ax.annotate(f"{display[row['architecture']]}-{row['temporal_method']}",
@@ -1014,7 +1076,8 @@ def _replay_figures(predictions, transitions, transition_summary, accuracy, outp
                 row = next((item for item in detailed if item["difficulty_level"] == difficulty
                             and item["transition_pair"] == pair
                             and item["architecture"] == architecture), None)
-                values.append(row.get("transition_window_accuracy_mean") if row else np.nan)
+                value = row.get("transition_window_accuracy_mean") if row else None
+                values.append(value if value is not None else np.nan)
             axis.bar(np.arange(len(pairs)) + offset, values, width,
                      color=colors[architecture], label=display[architecture])
         axis.set_title(difficulty.title()); axis.set_xticks(np.arange(len(pairs)), pairs,
@@ -1071,6 +1134,11 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     args.output.mkdir(parents=True, exist_ok=True)
+    # Fail before an expensive sweep if a config edit broke environment imports.
+    # Importing registers tasks but does not instantiate or step a simulator.
+    print("Checking locomotion environment/config imports...", flush=True)
+    subprocess.run([sys.executable, "-c",
+                    "import legged_gym.scripts.evaluation.high_level_evaluation"], check=True)
     paths = _run_conditions(args)
     payloads, layouts = _load_results(paths)
     if not payloads:
@@ -1109,6 +1177,11 @@ def main(argv=None):
     _write_csv(args.output / "locomotion_summary.csv", summary)
     _write_csv(args.output / "locomotion_by_difficulty.csv", by_difficulty)
     _write_csv(args.output / "locomotion_by_transition_pair.csv", _transition_pair_rows(per_episode))
+    _write_csv(args.output / "locomotion_transition_events.csv", [
+        dict({key: row.get(key) for key in (
+            "method", "difficulty_level", "evaluation_seed", "classifier_seed", "track_id", "episode_id", "result_path")},
+             episode_success=row["success"], **event)
+        for row in per_episode for event in row.get("transition_events", [])])
     _write_csv(args.output / "latency_per_run.csv", latency_per_run)
     _write_csv(args.output / "latency_summary.csv", latency_summary)
     replay_predictions, transition_lead_lag, transition_lead_lag_summary, replay_accuracy = (
@@ -1194,20 +1267,23 @@ def main(argv=None):
                           for key, value in layouts.items()},
         "representative_timeline": timeline,
         "trajectory_replay_diagnostics": {
-            "source_method": "oracle",
+            "source_methods": ["oracle", *sorted(LEARNED_METHODS)],
+            "metric_version": "eligible_episode_segment_v2",
             "classifier_seeds": args.selected_classifier_seeds,
             "temporal_methods": list(REPLAY_METHODS),
             "persistence_criterion": (
                 f"first {REPLAY_PERSISTENCE_TICKS} consecutive classification ticks "
-                "emitting the upcoming canonical skill"),
+                "emitting the upcoming canonical skill; pre-boundary run must survive the boundary; first match and misses assessed separately within target segment"),
             "transition_window_radius_classification_ticks": REPLAY_TRANSITION_RADIUS,
             "trained_models_or_filter_parameters_changed": False,
             "outputs": [
                 "trajectory_replay_predictions.csv", "transition_lead_lag.csv",
                 "transition_lead_lag_summary.csv", "replay_accuracy_summary.csv",
+                "locomotion_transition_events.csv", "replay_accuracy_by_source_pair.csv",
+                "replay_diagnostic_bundles/manifest.json",
             ],
             "source_files": [entry for payload in payloads
-                             if payload["metadata"]["paper_method"] == "oracle"
+                             if payload["metadata"]["paper_method"] != "distilled"
                              for entry in (payload.get("trajectory_replay") or {}).get("files", [])],
         },
         "completed_result_files": [payload["_path"] for payload in payloads],

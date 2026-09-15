@@ -19,10 +19,8 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
         rewards = self.cfg.rewards
         if not 0 <= rewards.feet_air_time_target < rewards.feet_air_time_max:
             raise ValueError("Require 0 <= feet_air_time_target < feet_air_time_max")
-        if not np.isfinite(rewards.feet_air_time_max) or not (
-                np.isfinite(rewards.feet_prolonged_air_time_penalty_rate)
-                and rewards.feet_prolonged_air_time_penalty_rate >= 0):
-            raise ValueError("Airtime limit and nonnegative penalty rate must be finite")
+        if not np.isfinite(rewards.feet_air_time_max):
+            raise ValueError("Airtime limit must be finite")
         # Keep configured zero-start curriculum terms in the reward registry.
         enabled = getattr(self.cfg.rewards, "use_reward_curriculum", False)
         if enabled:
@@ -32,8 +30,6 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
                     low, high = cfg.curr_reward_bounds[key]
                     self.reward_scales[key] = high if high != 0 else low
         super()._prepare_reward_function()
-        # Applied separately after positive clipping, but logged with other terms.
-        self.episode_sums["feet_prolonged_air_time"] = torch.zeros_like(self.rew_buf)
         if enabled:
             self.step_reward_curriculum(0)
         self.obstacle_progress = None
@@ -45,10 +41,6 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
     def compute_reward(self):
         self._update_feet_air_time()
         super().compute_reward()
-        penalty = (self._reward_feet_prolonged_air_time()
-                   * self.cfg.rewards.feet_prolonged_air_time_penalty_rate * self.dt)
-        self.rew_buf -= penalty
-        self.episode_sums["feet_prolonged_air_time"] -= penalty
         if self.obstacle_progress is not None:
             # This runs before reset_idx. Include simultaneous failure + timeout.
             failed = (self.gap_reset_buf |
@@ -511,12 +503,15 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
 
         Uses:
             - terrain-aware target height
-            - horizontal foot velocity weighting (same style as original reward)
+            - horizontal velocity weighting for moving, non-contact feet only
             - excess-height penalty to prevent over-swinging
+            - zero reward when there are no moving swing feet
         """
 
         feet_z = self.simulator.feet_pos[:, :, 2]                       # (N,4)
         foot_vel_xy_norm = torch.norm(self.simulator.feet_vel[:, :, :2], dim=-1)  # (N,4)
+        moving_swing = ((self.feet_max_force_z <= 1.) &
+                        (foot_vel_xy_norm > self.cfg.rewards.foot_clearance_min_swing_speed))
 
         # Flatten 3x3 terrain patch if needed, then take local max height near each foot
         h_patch = self.simulator._height_around_feet
@@ -546,11 +541,14 @@ class Go2DepthWaq(DepthMixin, LeggedRobotDreamwaq):
         excess_weight = 0.25  # tune: 0.1 - 0.5
 
         total_err = torch.sum(
-            foot_vel_xy_norm * (track_err + excess_weight * excess_err),
+            moving_swing * foot_vel_xy_norm * (track_err + excess_weight * excess_err),
             dim=-1
         )                                                               # (N,)
 
-        return torch.exp(-total_err / self.cfg.rewards.foot_clearance_tracking_sigma)
+        # Without this gate, zero velocity makes total_err zero and exp(0) pays
+        # the maximum for standing still (or holding a stationary foot aloft).
+        return (torch.exp(-total_err / self.cfg.rewards.foot_clearance_tracking_sigma)
+                * moving_swing.any(dim=-1))
     
     def _reward_base_height(self):
         # Only dedicated GAP training: inherited mixed-terrain tasks retain the

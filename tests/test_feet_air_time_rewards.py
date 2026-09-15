@@ -14,9 +14,9 @@ def load_subject():
     namespace = {"torch": torch}
     base_path = ROOT / "legged_gym/envs/base/legged_robot.py"
     base_tree = ast.parse(base_path.read_text())
-    reward = next(n for n in ast.walk(base_tree) if isinstance(n, ast.FunctionDef)
-                  and n.name == "compute_reward")
-    base = ast.ClassDef(name="Base", bases=[], keywords=[], body=[reward], decorator_list=[])
+    methods = [n for n in ast.walk(base_tree) if isinstance(n, ast.FunctionDef)
+               and n.name in ("compute_reward", "_prepare_reward_function")]
+    base = ast.ClassDef(name="Base", bases=[], keywords=[], body=methods, decorator_list=[])
     path = ROOT / "legged_gym/envs/go2/go2_depth_waq/go2_depth_waq.py"
     cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef)
                and n.name == "Go2DepthWaq")
@@ -29,13 +29,14 @@ def load_subject():
     return namespace["Go2DepthWaq"], namespace["Base"]
 
 
-def make_env(dt=.02, touchdown_reward=True):
+def make_env(dt=.02, touchdown_reward=True, penalty_scale=-1.):
     subject, base = load_subject()
     env = subject()
     env.dt = dt
+    env.num_envs = 2
+    env.device = "cpu"
     env.cfg = SimpleNamespace(rewards=SimpleNamespace(
-        feet_air_time_target=.25, feet_air_time_max=.5,
-        feet_prolonged_air_time_penalty_rate=1., only_positive_rewards=True))
+        feet_air_time_target=.25, feet_air_time_max=.5, only_positive_rewards=True))
     env.feet_air_time = torch.zeros(2, 4)
     env.feet_touchdown_air_time = torch.zeros(2, 4)
     env.last_contacts = torch.zeros(2, 4, dtype=torch.int)
@@ -43,11 +44,9 @@ def make_env(dt=.02, touchdown_reward=True):
     env.commands = torch.tensor([[1., 0., 0.], [0., 0., 0.]])
     env.obstacle_progress = None
     env.rew_buf = torch.zeros(2)
-    env.reward_names = ["feet_air_time"] if touchdown_reward else []
-    env.reward_functions = [env._reward_feet_air_time] if touchdown_reward else []
-    env.reward_scales = {"feet_air_time": .6 * dt} if touchdown_reward else {}
-    env.episode_sums = {key: torch.zeros(2) for key in
-                        ("feet_air_time", "feet_prolonged_air_time")}
+    env.reward_scales = {"feet_air_time": .6 if touchdown_reward else 0.,
+                         "feet_prolonged_air_time": penalty_scale}
+    env._prepare_reward_function()
     return env, base
 
 
@@ -71,13 +70,15 @@ def test_normal_swing_rewards_only_once_on_touchdown():
 
 @pytest.mark.parametrize("dt", [.01, .02, .04])
 @pytest.mark.parametrize("touchdown_reward", [True, False])
-def test_held_feet_cost_per_second_even_at_zero_command_and_after_clipping(dt, touchdown_reward):
+@pytest.mark.parametrize("clip", [True, False])
+def test_held_feet_cost_is_logged_before_clipping(dt, touchdown_reward, clip):
     env, _ = make_env(dt, touchdown_reward)
+    env.cfg.rewards.only_positive_rewards = clip
     swing(env, 2., feet=(0, 2))
     # Two feet, 1.5 seconds each after the grace period, at 1 reward/s.
     torch.testing.assert_close(env.episode_sums["feet_prolonged_air_time"],
                                torch.full((2,), -3.))
-    torch.testing.assert_close(env.rew_buf, torch.full((2,), -2. * dt))
+    torch.testing.assert_close(env.rew_buf, torch.full((2,), 0. if clip else -2. * dt))
     env.feet_max_force_z.fill_(10.)
     env.compute_reward()
     assert not env.rew_buf.any()  # No banked bonus on eventual touchdown.
@@ -110,13 +111,26 @@ def test_one_frame_contact_dropout_does_not_create_swing():
 
 
 def test_disabling_penalty_still_forfeits_prolonged_touchdown_bonus():
-    env, _ = make_env()
-    env.cfg.rewards.feet_prolonged_air_time_penalty_rate = 0.
+    env, _ = make_env(penalty_scale=0.)
     swing(env, 2.)
     env.feet_max_force_z.fill_(10.)
     env.compute_reward()
     assert not env.rew_buf.any()
-    assert not env.episode_sums["feet_prolonged_air_time"].any()
+    assert "feet_prolonged_air_time" not in env.episode_sums
+    assert "feet_prolonged_air_time" not in env.reward_names
+
+
+def test_penalty_reduces_other_rewards_before_total_is_clipped():
+    env, _ = make_env(penalty_scale=-.2)
+    env.reward_names.append("other")
+    env.reward_functions.append(lambda: torch.tensor([.1, .001]))
+    env.reward_scales["other"] = 1.
+    env.episode_sums["other"] = torch.zeros(2)
+    swing(env, 1.)
+    # One overdue foot costs .2 * .02 = .004 in both environments.
+    torch.testing.assert_close(env.rew_buf, torch.tensor([.096, 0.]))
+    torch.testing.assert_close(env.episode_sums["feet_prolonged_air_time"],
+                               torch.full((2,), -.1))
 
 
 def test_partial_reset_clears_airtime_and_contact_history():

@@ -27,7 +27,7 @@ from typing import List, Sequence
 
 import torch
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 class SingleDepthCNNExporterWaQ(torch.nn.Module):
@@ -278,14 +278,16 @@ def export_policy(
     torch.jit.script(exporter).save(str(output_dir / "policy.pt"))
 
     cnn, features = exporter.split_cnn()
-    torch.jit.script(cnn.cpu().eval()).save(str(output_dir / "DepthCNN.pt"))
-    torch.jit.script(features.cpu().eval()).save(str(output_dir / "FeaturesWaQ.pt"))
+    split_dir = output_dir / "split"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    torch.jit.script(cnn.cpu().eval()).save(str(split_dir / "DepthCNN.pt"))
+    torch.jit.script(features.cpu().eval()).save(str(split_dir  / "FeaturesWaQ.pt"))
     write_manifest(output_dir, mode, checkpoints, args_files)
 
     print(f"Exported {len(actor_critics)} policy/policies to: {output_dir}")
     print(f"  combined: {output_dir / 'policy.pt'}")
-    print(f"  split CNN: {output_dir / 'DepthCNN.pt'}")
-    print(f"  split actor: {output_dir / 'FeaturesWaQ.pt'}")
+    print(f"  split CNN: {split_dir / 'DepthCNN.pt'}")
+    print(f"  split actor: {split_dir / 'FeaturesWaQ.pt'}")
     print(f"  manifest: {output_dir / 'manifest.json'}")
 
 
