@@ -167,7 +167,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
             stationary_penalty_rate = 0.10  # reward/s deducted; 0 disables penalty
             stationary_grace_s = 0.10  # continuous stationary time before charging
 
-        use_reward_curriculum = False
+        use_reward_curriculum = True
 
         class reward_curriculum:
             # PACT schedule plus joint-velocity penalties; absent terms are skipped.
@@ -186,8 +186,8 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                 "action_smoothness":[-1.0e-6, -1.0e-2],
                 "collision":[-0.1, -1.0],
             }
-            warmup_steps = 20000
-            curr_steps = 20000
+            warmup_steps = 5000
+            curr_steps = 5000
         
         soft_dof_pos_limit = 0.9
         soft_dof_vel_limit = 0.9
@@ -212,9 +212,8 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
             dof_vel_limits = -0.1
             dof_vel = -0.0001
             if terrain_name in ("baseline"):
-                use_reward_curriculum = False
                 torque_limits = -0.01
-                dof_close_to_default = -0.01
+                dof_close_to_default = -0.1
                 # limitation
                 dof_pos_limits = -2.0
                 collision = -1.0
@@ -234,7 +233,6 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                 feet_contact_stand_still = 0.5
                 dof_close_to_default_stand_still = -0.5
             elif terrain_name in ("gap", "stairs", "all_stairs"):
-                use_reward_curriculum = True
                 dof_pos_limits = -2.0
                 collision = -2.0
                 tracking_lin_vel = 2.0
@@ -253,7 +251,6 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
                 feet_near_edge = -1.0
                 feet_air_time = 0.6
             elif terrain_name in ("pit", "center_platform", "all_pit"):
-                use_reward_curriculum = True
                 dof_pos_limits = -2.0
                 collision = -2.0
                 tracking_lin_vel = 2.0
@@ -395,7 +392,7 @@ class Go2DepthWaqCfg( LeggedRobotDreamwaqCfg ):
             pointcloud_in_world_frame = False
             horizontal_fov_deg = 88
             pos = (0.32, 0.0, 0.10)
-            euler = (0.0, 1.57 + 0.3, 0.0)
+            euler = (0.0, 1.57 + 0.14, 0.0)
             near_plane = 0.05
             far_plane = 4.00
             near_clip = 0.00
@@ -475,7 +472,7 @@ class Go2DepthWaqCfgPPO( LeggedRobotDreamwaqCfgPPO ):
             max_iterations = int(num_iters)
         else:
             if terrain_name in ("baseline"):
-                max_iterations = 10000
+                max_iterations = 20000
             #elif terrain_name in ("pit"):
             #    max_iterations = 40000
             #elif terrain_name in ("stairs", "gap"):
